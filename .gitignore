@@ -1,0 +1,19 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+
+# Installer output
+dist/
+
+# Go build cache
+vendor/
+
+# Claude Code local settings
+.claude/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
