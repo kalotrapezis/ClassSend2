@@ -152,7 +152,7 @@ func replayHistoryToTUI(app *core.App, conn net.Conn) {
 	}
 }
 
-// serveTUI reads TypeSend frames from the TUI and routes them to the teacher.
+// serveTUI reads frames from the TUI and routes them to the teacher or local handlers.
 func serveTUI(app *core.App, conn net.Conn) {
 	defer func() {
 		tuiMu.Lock()
@@ -164,11 +164,19 @@ func serveTUI(app *core.App, conn net.Conn) {
 	}()
 
 	for f := range ipc.ReadFrames(conn) {
-		if f.Type == ipc.TypeSend {
+		switch f.Type {
+		case ipc.TypeSend:
 			var p ipc.SendPayload
 			if json.Unmarshal(f.Data, &p) == nil && p.Text != "" {
 				app.SendChat(p.Text) //nolint:errcheck
 			}
+		case ipc.TypeSetNickname:
+			var p ipc.SetNicknamePayload
+			if json.Unmarshal(f.Data, &p) == nil && p.Name != "" {
+				app.SetNickname(p.Name) //nolint:errcheck
+			}
+		case ipc.TypeShowCast:
+			showCastingViewer()
 		}
 	}
 }

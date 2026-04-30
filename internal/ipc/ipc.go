@@ -22,11 +22,18 @@ const (
 	TypeDisconnected = "disconnected" // agent → TUI: lost connection to teacher
 	TypeForward      = "fwd"          // agent → TUI: raw protocol.Message forwarded from teacher
 	TypeSend         = "send"         // TUI → agent: send a chat message
+	TypeSetNickname  = "set_nickname" // TUI → agent: update the chat nickname
+	TypeShowCast     = "show_cast"    // TUI → agent: re-show the cast viewer window
 )
 
 // SendPayload is the data field for TypeSend frames.
 type SendPayload struct {
 	Text string `json:"text"`
+}
+
+// SetNicknamePayload is the data field for TypeSetNickname frames.
+type SetNicknamePayload struct {
+	Name string `json:"name"`
 }
 
 // Listen creates the agent's TCP listener.

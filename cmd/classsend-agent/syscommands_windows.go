@@ -78,6 +78,7 @@ var (
 	procCreateFontW      = gdi32.NewProc("CreateFontW")
 	procInvalidateRect   = user32.NewProc("InvalidateRect")
 	procDestroyWindow    = user32.NewProc("DestroyWindow")
+	procIsZoomed         = user32.NewProc("IsZoomed")
 	procSetDIBits        = gdi32.NewProc("SetDIBits")
 	procStretchBlt       = gdi32.NewProc("StretchBlt")
 
@@ -106,11 +107,12 @@ const (
 	dibRgbColors = 0
 	biRgb        = 0
 
-	wsExTopmost = 0x00000008
-	wsPopup     = 0x80000000
-	wsVisible   = 0x10000000
-	csHredraw   = 0x0002
-	csVredraw   = 0x0001
+	wsExTopmost        = 0x00000008
+	wsPopup            = 0x80000000
+	wsVisible          = 0x10000000
+	wsOverlappedWindow = 0x00CF0000
+	csHredraw          = 0x0002
+	csVredraw          = 0x0001
 
 	wmDestroy      = 0x0002
 	wmPaint        = 0x000F
@@ -122,7 +124,13 @@ const (
 	wmMbuttondown  = 0x0207
 	wmNclbuttondown = 0x00A1
 
-	hwndTopmost = ^uintptr(0) // HWND_TOPMOST = (HWND)(-1)
+	hwndTopmost    = ^uintptr(0) // HWND_TOPMOST  = (HWND)(-1)
+	hwndNotopmost  = ^uintptr(1) // HWND_NOTOPMOST = (HWND)(-2)
+
+	swHide     = 0
+	swMaximize = 3
+	swShow     = 5
+	swRestore  = 9
 
 	swpNomove    = 0x0002
 	swpNosize    = 0x0001
@@ -146,6 +154,9 @@ const (
 	vkF4      = 0x73
 	vkMenu    = 0x12 // Alt
 	vkControl = 0x11
+
+	vkCharF = 0x46 // 'F' key — toggle fullscreen in cast viewer
+	vkCharT = 0x54 // 'T' key — toggle stay-on-top in cast viewer
 
 	vkVolumeMute   = 0xAD
 	keyeventfKeyup = 0x0002
@@ -710,8 +721,9 @@ const (
 )
 
 var (
-	castViewMu   sync.Mutex
-	castViewHwnd uintptr
+	castViewMu      sync.Mutex
+	castViewHwnd    uintptr
+	castViewTopmost bool
 
 	castClientMu  sync.Mutex
 	castClientConn *network.CastClient // active cast connection, nil when idle
@@ -728,10 +740,35 @@ func castViewWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		procInvalidateRect.Call(hwnd, 0, 1)
 		return 0
 	case wmCastClose:
-		procDestroyWindow.Call(hwnd)
+		// Teacher stopped cast — hide the window (keep alive for reuse)
+		procShowWindow.Call(hwnd, swHide)
 		return 0
 	case wmClose:
-		return 0 // block user close — teacher controls this
+		// User clicked the X button — hide instead of destroying
+		procShowWindow.Call(hwnd, swHide)
+		return 0
+	case wmKeydown:
+		switch wParam {
+		case vkCharT: // toggle stay-on-top
+			castViewMu.Lock()
+			nowTop := !castViewTopmost
+			castViewTopmost = nowTop
+			castViewMu.Unlock()
+			zorder := uintptr(hwndNotopmost)
+			if nowTop {
+				zorder = hwndTopmost
+			}
+			procSetWindowPos.Call(hwnd, zorder, 0, 0, 0, 0, swpNomove|swpNosize)
+			return 0
+		case vkCharF: // toggle maximize / restore
+			zoomed, _, _ := procIsZoomed.Call(hwnd)
+			if zoomed != 0 {
+				procShowWindow.Call(hwnd, swRestore)
+			} else {
+				procShowWindow.Call(hwnd, swMaximize)
+			}
+			return 0
+		}
 	case wmPaint:
 		drawCastFrame(hwnd)
 		return 0
@@ -837,13 +874,17 @@ func updateCastFrame(jpegData []byte) {
 
 func showCastingViewer() {
 	castViewMu.Lock()
-	defer castViewMu.Unlock()
 	if castViewHwnd != 0 {
+		hwnd := castViewHwnd
+		castViewMu.Unlock()
+		procShowWindow.Call(hwnd, swShow)
+		procSetForegroundWindow.Call(hwnd)
 		return
 	}
 	ready := make(chan uintptr, 1)
 	go runCastViewWindow(ready)
 	castViewHwnd = <-ready
+	castViewMu.Unlock()
 }
 
 func hideCastingViewer() {
@@ -855,7 +896,7 @@ func hideCastingViewer() {
 	}
 	castClientMu.Unlock()
 
-	// Destroy Win32 window
+	// Hide the Win32 window (post wmCastClose so the UI thread handles it)
 	castViewMu.Lock()
 	hwnd := castViewHwnd
 	castViewMu.Unlock()
@@ -907,26 +948,28 @@ func runCastViewWindow(hwndOut chan<- uintptr) {
 	}
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
-	// Fullscreen — covers the entire screen
+	// Centered 960×600 resizable window
 	sw, _, _ := procGetSystemMetrics.Call(smCxScreen)
 	sh, _, _ := procGetSystemMetrics.Call(smCyScreen)
+	const winW, winH = 960, 600
+	winX := (int(sw) - winW) / 2
+	winY := (int(sh) - winH) / 2
 
 	hwnd, _, _ := procCreateWindowExW.Call(
-		wsExTopmost,
+		0,
 		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(utf16("Οθόνη Δασκάλου — ClassSend"))),
-		wsPopup|wsVisible,
-		0, 0, sw, sh,
+		uintptr(unsafe.Pointer(utf16("Οθόνη Δασκάλου — ClassSend  [F: πλήρης οθόνη | T: πάντα πάνω]"))),
+		wsOverlappedWindow|wsVisible,
+		uintptr(winX), uintptr(winY), winW, winH,
 		0, 0, hInst, 0,
 	)
-	procSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0, swpNomove|swpNosize|swpShowWindow)
 
 	hwndOut <- hwnd
 
 	var m winMsg
 	for {
 		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
-		if r == 0 {
+		if r == 0 || r == ^uintptr(0) {
 			break
 		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))

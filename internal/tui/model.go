@@ -701,6 +701,17 @@ func (m *Model) trySend() tea.Cmd {
 		return nil
 	}
 
+	// Student: --cast  re-open the cast viewer window
+	if text == "--cast" && m.app.Role == core.RoleStudent {
+		if m.app.HasAgentConn() {
+			m.app.SendShowCast()
+			m.pushSysMsg("📡 Ενεργοποίηση παραθύρου cast...")
+		} else {
+			m.pushSysMsg("⚠ --cast: απαιτεί τον πράκτορα (classsend-agent.exe)")
+		}
+		return nil
+	}
+
 	// Easter eggs
 	if text == "--coffee" {
 		m.pushSysMsg("☕ Κάνε ένα διάλειμμα... αξίζεις έναν καφέ!")
@@ -809,6 +820,14 @@ func (m *Model) trySend() tea.Cmd {
 			return nil
 		}
 		return m.doDownload(dlArg)
+	}
+
+	// Student: check against local blacklist copy before sending
+	if m.app.Role == core.RoleStudent {
+		if blocked := m.app.CheckBlacklist(text); blocked != "" {
+			m.pushSysMsg(fmt.Sprintf("🚫 Η λέξη \"%s\" δεν επιτρέπεται", blocked))
+			return nil
+		}
 	}
 
 	// If a file is staged, send it with the message text as caption
@@ -1025,6 +1044,7 @@ func (m *Model) helpLines() []string {
 		"  --set autostart on|off       εκκίνηση με Windows",
 		"  --set list import <αρχείο>   εισαγωγή λιστών (παλιά & νέα μορφή)",
 		"  --set list export [αρχείο]   εξαγωγή λιστών (προεπ: Downloads/)",
+		"  --cast                       επαναφορά παραθύρου casting",
 		"",
 		"  ΕΝΤΟΛΕΣ ΔΑΣΚΑΛΟΥ",
 		"  --pin              καρφίτσωμα τελευταίου δικού σου  ^P",
@@ -1068,7 +1088,8 @@ func (m *Model) helpLines() []string {
 		"  h/--h → --help      d/--d → --download   o/--o → --open",
 		"  a/--a → --attach    p/--p → --pin         r/--r → --report",
 		"  c/--c → --copy      u/--u → --unpin       t → --t",
-		"  --t <Tab>  κύκλος εντολών: lock unlock mute unmute shot …",
+		"  s/--s → --set       --t <Tab>  κύκλος εντολών: lock unlock mute…",
+		"  --set <Tab>  κύκλος ρυθμίσεων: nickname autostart list",
 		"",
 		"  Παραδείγματα:",
 		"  Διαβάστε σελ.4 --pin",
@@ -1413,6 +1434,9 @@ func (m *Model) renderMessages() string {
 			}
 			if msg.Reported {
 				prefix = styleReportTag.Render("[rep] ") + prefix
+			}
+			if msg.Blocked {
+				prefix = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF4444")).Bold(true).Render("[🚫] ") + prefix
 			}
 
 			// Rolling window label [X.Y] — shown for all including self (0.Y)
@@ -2319,6 +2343,8 @@ var tabCompletions = []struct{ prefix, full string }{
 	{"--b", "--black"},
 	{"--ps", "--pass"},
 	{"--cl", "--clr"},
+	{"--se", "--set"},
+	{"--s", "--set"},
 	// single-letter shortcuts
 	{"h", "--help"},
 	{"d", "--download"},
@@ -2329,7 +2355,11 @@ var tabCompletions = []struct{ prefix, full string }{
 	{"r", "--report"},
 	{"c", "--copy"},
 	{"t", "--t"},
+	{"s", "--set"},
 }
+
+// setSubcommands is the ordered list cycled when Tab is pressed after "--set ".
+var setSubcommands = []string{"nickname", "autostart", "list"}
 
 // toolNames is the ordered list of --t tool keywords cycled by Tab.
 var toolNames = []string{
@@ -2352,6 +2382,30 @@ func (m *Model) doTabComplete() {
 	trimmed := strings.TrimSpace(cur)
 	if trimmed == "" {
 		return
+	}
+
+	// Special case: --set <partial> → cycle through setting names
+	for _, pfx := range []string{"--set ", "--set"} {
+		if trimmed == "--set" || strings.HasPrefix(trimmed, "--set ") {
+			partial := ""
+			if strings.HasPrefix(trimmed, "--set ") {
+				partial = strings.TrimSpace(trimmed[len("--set "):])
+			}
+			var matches []string
+			for _, s := range setSubcommands {
+				if strings.HasPrefix(s, partial) {
+					matches = append(matches, "--set "+s)
+				}
+			}
+			if len(matches) > 0 {
+				m.tabMatches = matches
+				m.tabIdx = 0
+				m.input.SetValue(matches[0])
+				m.input.CursorEnd()
+			}
+			_ = pfx
+			return
+		}
 	}
 
 	// Special case: --t / --tool <partial> → cycle through tool names
@@ -2428,6 +2482,8 @@ var knownCmdTokens = map[string]bool{
 	"--clr": true, "--clear": true,
 	"--t": true, "--tool": true,
 	"--send": true,
+	"--set": true,
+	"--cast": true,
 }
 
 // looksLikeCommand returns true when any whitespace-separated token exactly
@@ -2590,6 +2646,7 @@ func (m *Model) handleSet(args string) {
 		if err := m.app.SetNickname(rest); err != nil {
 			m.pushSysMsg("⚠ " + err.Error())
 		} else {
+			m.app.SendNicknameUpdateToAgent(m.app.Nickname)
 			m.pushSysMsg(fmt.Sprintf("✅ Όνομα: %s", m.app.Nickname))
 		}
 

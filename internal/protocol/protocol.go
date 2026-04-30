@@ -146,13 +146,15 @@ type ReportPayload struct {
 }
 
 type StatePayload struct {
-	ChatBlocked  bool `json:"chat_blocked"`
-	FilesBlocked bool `json:"files_blocked"`
-	HandsBlocked bool `json:"hands_blocked"`
-	ScreenLocked bool `json:"screen_locked"`
-	Muted        bool `json:"muted"`
-	Monitoring   bool `json:"monitoring"`
-	Casting      bool `json:"casting,omitempty"`
+	ChatBlocked  bool     `json:"chat_blocked"`
+	FilesBlocked bool     `json:"files_blocked"`
+	HandsBlocked bool     `json:"hands_blocked"`
+	ScreenLocked bool     `json:"screen_locked"`
+	Muted        bool     `json:"muted"`
+	Monitoring   bool     `json:"monitoring"`
+	Casting      bool     `json:"casting,omitempty"`
+	Blacklist    []string `json:"blacklist,omitempty"`
+	Whitelist    []string `json:"whitelist,omitempty"`
 }
 
 type PinPayload struct {

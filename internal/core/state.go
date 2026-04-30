@@ -168,6 +168,8 @@ func (a *App) StartTeacher() error {
 		// Send current class state so late joiners are in sync
 		a.mu.RLock()
 		state := a.State
+		bl := append([]string(nil), a.Blacklist...)
+		wl := append([]string(nil), a.Whitelist...)
 		a.mu.RUnlock()
 		stateMsg, _ := protocol.Encode(protocol.TypeState, protocol.StatePayload{
 			ChatBlocked:  state.ChatBlocked,
@@ -177,6 +179,8 @@ func (a *App) StartTeacher() error {
 			Muted:        state.Muted,
 			Monitoring:   state.Monitoring,
 			Casting:      state.Casting,
+			Blacklist:    bl,
+			Whitelist:    wl,
 		})
 		st.Send(stateMsg)
 
@@ -308,6 +312,122 @@ func (a *App) StartStudent() error {
 
 // Mu returns the App's mutex so the agent can lock it for history replay.
 func (a *App) Mu() *sync.RWMutex { return &a.mu }
+
+// HasAgentConn reports whether the student TUI is connected to a background agent.
+func (a *App) HasAgentConn() bool { return a.agentConn != nil }
+
+// SendNicknameUpdateToAgent pushes a nickname change to the background agent so its
+// outgoing chat messages use the updated name immediately (no restart needed).
+func (a *App) SendNicknameUpdateToAgent(name string) {
+	if a.agentConn == nil {
+		return
+	}
+	raw, _ := json.Marshal(ipc.SetNicknamePayload{Name: name})
+	ipc.WriteFrame(a.agentConn, ipc.Frame{Type: ipc.TypeSetNickname, Data: raw}) //nolint:errcheck
+}
+
+// SendShowCast asks the background agent to re-show the cast viewer window.
+func (a *App) SendShowCast() {
+	if a.agentConn == nil {
+		return
+	}
+	ipc.WriteFrame(a.agentConn, ipc.Frame{Type: ipc.TypeShowCast}) //nolint:errcheck
+}
+
+// CheckBlacklist returns the first blacklist word that fuzzy-matches a word in
+// content, or "" if the message is clean.  Whitelist entries always pass.
+// Matching uses Levenshtein distance scaled to word length to catch typos.
+func (a *App) CheckBlacklist(content string) string {
+	a.mu.RLock()
+	blacklist := append([]string(nil), a.Blacklist...)
+	whitelist := append([]string(nil), a.Whitelist...)
+	a.mu.RUnlock()
+
+	if len(blacklist) == 0 {
+		return ""
+	}
+
+	for _, mw := range strings.Fields(strings.ToLower(content)) {
+		mwRunes := []rune(mw)
+		if len(mwRunes) < 3 {
+			continue // too short — too many false positives
+		}
+		// whitelist override: if the word exactly matches a whitelist entry, skip it
+		whitelisted := false
+		for _, ww := range whitelist {
+			if strings.EqualFold(mw, ww) {
+				whitelisted = true
+				break
+			}
+		}
+		if whitelisted {
+			continue
+		}
+		for _, bw := range blacklist {
+			bwRunes := []rune(strings.ToLower(bw))
+			if len(bwRunes) < 2 {
+				if strings.EqualFold(mw, bw) {
+					return bw
+				}
+				continue
+			}
+			// threshold: 0 for ≤4-char words, 1 for ≤7, 2 for ≤10, 3 for longer
+			threshold := 0
+			switch {
+			case len(bwRunes) > 10:
+				threshold = 3
+			case len(bwRunes) > 7:
+				threshold = 2
+			case len(bwRunes) > 4:
+				threshold = 1
+			}
+			if levenshtein(mwRunes, bwRunes) <= threshold {
+				return bw
+			}
+		}
+	}
+	return ""
+}
+
+func levenshtein(a, b []rune) int {
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			curr[j] = min3(curr[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev, curr = curr, prev
+	}
+	return prev[lb]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
+}
 
 // ConnectViaAgent connects the student TUI to the background agent instead of
 // talking to the teacher directly.  The agent handles all TCP + system commands;
@@ -445,6 +565,8 @@ func (a *App) SendCommand(action, param, targetStudentID string) error {
 func (a *App) broadcastState() {
 	a.mu.RLock()
 	state := a.State
+	bl := append([]string(nil), a.Blacklist...)
+	wl := append([]string(nil), a.Whitelist...)
 	a.mu.RUnlock()
 	stateMsg, err := protocol.Encode(protocol.TypeState, protocol.StatePayload{
 		ChatBlocked:  state.ChatBlocked,
@@ -454,6 +576,8 @@ func (a *App) broadcastState() {
 		Muted:        state.Muted,
 		Monitoring:   state.Monitoring,
 		Casting:      state.Casting,
+		Blacklist:    bl,
+		Whitelist:    wl,
 	})
 	if err == nil {
 		a.Server.Broadcast(stateMsg)
@@ -515,6 +639,24 @@ func (a *App) handleStudentMessage(st *network.Student, msg protocol.Message) {
 		blocked := a.State.ChatBlocked
 		a.mu.RUnlock()
 		if blocked {
+			return
+		}
+		// Server-side blacklist enforcement — catches bypasses of client-side check
+		if match := a.CheckBlacklist(payload.Content); match != "" {
+			cm := ChatMessage{
+				ID:        newMsgID(),
+				From:      payload.From,
+				Content:   payload.Content,
+				Timestamp: time.Unix(payload.Timestamp, 0),
+				Blocked:   true,
+			}
+			a.mu.Lock()
+			a.Messages = append(a.Messages, cm)
+			a.mu.Unlock()
+			if a.OnChatMessage != nil {
+				a.OnChatMessage(cm) // teacher sees it with [🚫] marker
+			}
+			go a.saveMessages()
 			return
 		}
 		cm := ChatMessage{
@@ -704,6 +846,13 @@ func (a *App) handleTeacherMessage(msg protocol.Message) {
 			Monitoring:   payload.Monitoring,
 			Casting:      payload.Casting,
 		}
+		// Sync blacklist/whitelist from teacher (enables client-side blocking)
+		if len(payload.Blacklist) > 0 {
+			a.Blacklist = payload.Blacklist
+		}
+		if len(payload.Whitelist) > 0 {
+			a.Whitelist = payload.Whitelist
+		}
 		a.mu.Unlock()
 		if a.OnStateChange != nil {
 			a.OnStateChange(a.State)
@@ -798,17 +947,24 @@ func (a *App) AddToBlacklist(words []string) {
 	a.Blacklist = append(a.Blacklist, words...)
 	a.mu.Unlock()
 	go a.saveLists()
+	if a.Server != nil {
+		a.broadcastState()
+	}
 }
 
 // RemoveBlacklistEntry removes the entry at position i (0-based) from the blacklist.
 func (a *App) RemoveBlacklistEntry(i int) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if i < 0 || i >= len(a.Blacklist) {
+		a.mu.Unlock()
 		return fmt.Errorf("δεν υπάρχει @B%d", i+1)
 	}
 	a.Blacklist = append(a.Blacklist[:i], a.Blacklist[i+1:]...)
+	a.mu.Unlock()
 	go a.saveLists()
+	if a.Server != nil {
+		a.broadcastState()
+	}
 	return nil
 }
 
@@ -818,17 +974,24 @@ func (a *App) AddToWhitelist(words []string) {
 	a.Whitelist = append(a.Whitelist, words...)
 	a.mu.Unlock()
 	go a.saveLists()
+	if a.Server != nil {
+		a.broadcastState()
+	}
 }
 
 // RemoveWhitelistEntry removes the entry at position i (0-based) from the whitelist.
 func (a *App) RemoveWhitelistEntry(i int) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if i < 0 || i >= len(a.Whitelist) {
+		a.mu.Unlock()
 		return fmt.Errorf("δεν υπάρχει @W%d", i+1)
 	}
 	a.Whitelist = append(a.Whitelist[:i], a.Whitelist[i+1:]...)
+	a.mu.Unlock()
 	go a.saveLists()
+	if a.Server != nil {
+		a.broadcastState()
+	}
 	return nil
 }
 
