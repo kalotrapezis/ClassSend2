@@ -5,6 +5,10 @@ A classroom management application for teachers and students, built with Go. Pro
 > Successor to the original ClassSend, deployed in a real Greek classroom.
 
 ---
+<img width="1184" height="772" alt="εικόνα" src="https://github.com/user-attachments/assets/d3661cea-939f-4a49-a6bb-39deda6d58e7" />
+<img width="516" height="440" alt="εικόνα" src="https://github.com/user-attachments/assets/6321a067-a6b5-476f-95d7-2f52843bceba" />
+<img width="673" height="451" alt="εικόνα" src="https://github.com/user-attachments/assets/c83c376c-1b30-4d60-9931-7692496b0b87" />
+
 
 ## Features
 
