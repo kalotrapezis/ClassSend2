@@ -1,5 +1,5 @@
 #define MyAppName      "ClassSend 2"
-#define MyAppVersion   "0.0.1"
+#define MyAppVersion   "0.0.2"
 #define MyAppPublisher "ClassSend"
 
 ; ── Installer metadata ────────────────────────────────────────────────────────
@@ -37,19 +37,23 @@ Source: "..\monitoring.exe";      DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsTeacherRole
 
 ; Student
-Source: "..\student.exe";         DestDir: "{app}"; DestName: "classsend.exe"; \
+Source: "..\student.exe";                        DestDir: "{app}"; DestName: "classsend.exe"; \
     Flags: ignoreversion; Check: IsStudentRole
-Source: "..\classsend-agent.exe"; DestDir: "{app}"; Flags: ignoreversion; \
-    Check: IsStudentRole
+Source: "..\dist\classsend-agent-win10-x64.exe"; DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModernAgent
+Source: "..\dist\classsend-agent-win7-x86.exe";  DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseLegacyAgent
 
 ; Dev — all four exes, teacher.exe kept as teacher.exe (not renamed)
-Source: "..\teacher.exe";         DestDir: "{app}"; Flags: ignoreversion; \
+Source: "..\teacher.exe";                        DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
-Source: "..\student.exe";         DestDir: "{app}"; Flags: ignoreversion; \
+Source: "..\student.exe";                        DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
-Source: "..\classsend-agent.exe"; DestDir: "{app}"; Flags: ignoreversion; \
-    Check: IsDevRole
-Source: "..\monitoring.exe";      DestDir: "{app}"; Flags: ignoreversion; \
+Source: "..\dist\classsend-agent-win10-x64.exe"; DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsDevRole and UseModernAgent
+Source: "..\dist\classsend-agent-win7-x86.exe";  DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsDevRole and UseLegacyAgent
+Source: "..\monitoring.exe";                     DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
 
 ; ── Shortcuts ─────────────────────────────────────────────────────────────────
@@ -124,6 +128,26 @@ Filename: "{app}\student.exe"; Parameters: "--dev"; \
 
 ; ── Code — role selection page ────────────────────────────────────────────────
 [Code]
+
+function IsWin10OrLater: Boolean;
+var
+  Ver: TWindowsVersion;
+begin
+  GetWindowsVersionEx(Ver);
+  Result := Ver.Major >= 10;
+end;
+
+function UseModernAgent: Boolean;
+begin
+  // Win10+ x64 gets the native 64-bit agent
+  Result := IsWin64 and IsWin10OrLater;
+end;
+
+function UseLegacyAgent: Boolean;
+begin
+  // Win7/8 (any bitness) and Win10 x86 get the 32-bit Go 1.20 agent
+  Result := not UseModernAgent;
+end;
 
 var
   RolePage:    TWizardPage;

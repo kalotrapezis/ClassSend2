@@ -15,7 +15,7 @@ A classroom management application for teachers and students, built with Go. Pro
 - **Monitoring grid** (`tvon`): live screenshot thumbnails from all student PCs in a Win32 grid window
 - **Screen casting** (`casting` / `cas`, stop: `casoff`, toggle: `^S`): broadcasts the teacher's screen as JPEG frames to all students in real time
 - Pin/unpin messages (`--pin` / `--upin`), delete messages (`--del`), report students (`--rem`)
-- Blacklist + whitelist overlay (`^L`) with import/export
+- Blacklist + whitelist overlay (`^L`) with fuzzy enforcement and import/export
 - File transfer (chunked, 32 KB frames) with zip-all download
 - Push-open: send a URL or file to open on all student machines (`push_open`)
 - Media library pin for shared resources
@@ -27,6 +27,8 @@ A classroom management application for teachers and students, built with Go. Pro
 - Student UI (`student.exe`) connects to the agent via local IPC; can be closed and reopened without dropping the session
 - Late-join message history replay
 - Amber monitoring notification banner (appears when teacher starts monitoring)
+- **Cast viewer**: resizable window (960×600) showing teacher's screen; `T` = toggle always-on-top, `F` = maximize, `X` = hide; reopen with `--cast`
+- **Blacklist enforcement**: messages containing blacklisted words (with fuzzy matching) are blocked before sending
 
 ### Easter Eggs
 - `--coffee` — ☕ break reminder
@@ -71,7 +73,7 @@ Teacher TUI ──TCP──► Teacher server (internal/network/server.go)
 
 ## Build
 
-**Requirements:** Go 1.24+, Windows (for the agent and monitoring executables), Inno Setup 6 (for the installer).
+**Requirements:** Go 1.24+ (main build), Go 1.20.14 at `C:\Go120\` (Win7 agent build), Windows, Inno Setup 6.
 
 ```bat
 build.bat
@@ -85,16 +87,20 @@ Output files:
 | `student.exe` | Student PCs | Chat TUI only |
 | `classsend-agent.exe` | Student PCs | Hidden background process |
 | `monitoring.exe` | Teacher PC | Screenshot grid |
-| `dist/ClassSend2-Setup-v0.0.1.exe` | All PCs | Inno Setup installer |
+| `dist/ClassSend2-Setup-v0.0.2.exe` | All PCs | Inno Setup installer (Win7 SP1 – Win11) |
 
 Role is baked in at build time via `-ldflags="-X main.defaultRole=teacher"` (or `student`).  
 `classsend-agent.exe` is built with `-H windowsgui` — no console window.
+
+The installer bundles two agent binaries and selects at install time:
+- **Win10+ x64** → native 64-bit agent (Go 1.24+)
+- **Win7/8 or 32-bit** → 32-bit agent built with Go 1.20.14
 
 ---
 
 ## Installation
 
-Run `dist/ClassSend2-Setup-v0.0.1.exe` and choose a role:
+Run `dist/ClassSend2-Setup-v0.0.2.exe` and choose a role:
 
 | Role | What gets installed | Auto-start |
 |---|---|---|
@@ -103,6 +109,8 @@ Run `dist/ClassSend2-Setup-v0.0.1.exe` and choose a role:
 | **Developer / Testing** | All four executables | Agent with `--dev` at login |
 
 The Developer option is designed for single-machine testing: start Agent → start Teacher → start Student.
+
+**Minimum OS:** Windows 7 SP1 (32-bit or 64-bit).
 
 ---
 
@@ -139,20 +147,31 @@ Default lists ship with 54 blacklist entries and 43 whitelist entries seeded fro
 | `--cp` | Copy pinned content |
 | `--op` | Open pinned file/URL |
 | `--t <cmd>` | Send system command (lock/unlock/mute/shot/tvon/tvoff/casting/casoff/…) |
-| `--set nickname <name>` | Set display name (persisted) |
+| `--set nickname <name>` | Set display name (persisted, synced to agent) |
+| `--set autostart on/off` | Enable/disable agent autostart |
 | `--set list import <file>` | Import blacklist/whitelist |
 | `--set list export [file]` | Export blacklist/whitelist |
+| `--cast` *(student)* | Reopen cast viewer window if closed |
 
 **Keyboard shortcuts:**
 
 | Key | Action |
 |---|---|
+| `^S` | Toggle screen casting (teacher) |
 | `^T` | Tools overlay |
 | `^A` | File picker |
 | `^H` | Help overlay |
 | `^L` | Blacklist/Whitelist overlay (teacher) |
 | `↑` / `↓` | Command history |
 | `Tab` | Autocomplete command |
+
+**Cast viewer shortcuts (student window):**
+
+| Key | Action |
+|---|---|
+| `T` | Toggle always-on-top |
+| `F` | Toggle maximize / restore |
+| `X` | Hide window (cast continues) |
 
 ---
 

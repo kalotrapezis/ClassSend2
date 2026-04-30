@@ -8,21 +8,62 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-- **Screen casting** (`--t casting` / `--t cas`, stop with `--t casoff` / `^S` toggle): high-quality, low-latency screen broadcast over a dedicated TCP stream (port 47821), separate from the main chat connection.
-  - **30 FPS** GDI native-resolution capture (`GetDIBits` → BGRA → JPEG) with adaptive quality control (Q50–Q90, starts at Q85, adjusts every 60 frames based on frame-drop rate)
-  - **Latest-frame-only fanout** — each student connection holds only the newest frame (`atomic.Value` + buffered-1 notify channel); slow students drop frames instead of queueing, teacher never blocks
-  - **TCP_NODELAY** and 4 MB socket buffers on the cast server for minimal latency
-  - **Fullscreen Win32 viewer** on student machines (`wsPopup | wsExTopmost`, covers entire screen); students cannot close it — only `CmdStopCast` from the teacher does
-  - `CmdStartCast` carries the server address (`LAN_IP:47821`) as its parameter; students dial directly, bypassing the main TCP connection entirely
-  - New commands `CmdStartCast` / `CmdStopCast`; `Casting` field in `ClassState` / `StatePayload` so late-joining students receive correct state
-  - `^S` keyboard shortcut in TUI toggles casting on/off; `"Casting●"` indicator in bottom bar when active
-
 ### Planned
 - `^1`–`^0` tool shortcut keys
 - Persistent teacher daemon (session survives TUI close)
 - System tray icon for student agent
 - Subnet scan with 30-day network history prioritization
+
+---
+
+## [0.0.2] — 2026-04-30
+
+### Added
+
+#### Screen casting
+- **Screen casting** (`--t casting` / `--t cas`, stop with `--t casoff` / `^S` toggle): high-quality, low-latency screen broadcast over a dedicated TCP stream (port 47821), separate from the main chat connection
+  - **30 FPS** GDI native-resolution capture (`GetDIBits` → BGRA → JPEG) with adaptive quality control (Q50–Q90, starts at Q85, adjusts every 60 frames based on frame-drop rate)
+  - **Latest-frame-only fanout** — each student connection holds only the newest frame (`atomic.Value` + buffered-1 notify channel); slow students drop frames instead of queuing, teacher never blocks
+  - **TCP_NODELAY** and 4 MB socket buffers on the cast server for minimal latency
+  - `CmdStartCast` carries the server address (`LAN_IP:47821`) as its parameter; students dial directly, bypassing the main TCP connection entirely
+  - `^S` keyboard shortcut in TUI toggles casting on/off; `"Casting●"` indicator in bottom bar when active
+  - `Casting` field in `ClassState` / `StatePayload` so late-joining students receive correct state
+
+#### Cast viewer — windowed
+- Cast viewer on student machines converted from a fullscreen popup (`wsPopup|wsExTopmost`) to a **resizable overlapped window** (`WS_OVERLAPPEDWINDOW`) centered at 960×600
+- **`X` button** hides the window instead of destroying it — window is reused when the next cast starts
+- **`T` key** toggles always-on-top while the cast window is focused
+- **`F` key** toggles maximize / restore
+- **`--cast`** student command to reopen the cast viewer if they closed it mid-session
+
+#### Blacklist enforcement
+- **Client-side blocking**: student's `trySend()` checks the locally-synced blacklist before sending — message is rejected immediately with a warning, never reaches the server
+- **Server-side blocking**: teacher server also rejects blacklisted messages as a safety net; blocked messages stored with `Blocked: true`, shown to teacher only with a `[🚫]` prefix, not broadcast to other students
+- **Fuzzy matching** via Levenshtein distance, scaled to word length:
+  - ≤ 4 chars → exact match only
+  - 5–7 chars → 1 edit allowed
+  - 8–10 chars → 2 edits allowed
+  - 11+ chars → 3 edits allowed
+  - Words shorter than 3 characters are skipped; whitelist entries override blacklist matches
+- `StatePayload` now carries `Blacklist` and `Whitelist` slices — students receive the lists on join and on every add/remove mutation, so enforcement is always in sync
+
+#### `--set` UX fixes
+- `--set` is now highlighted blue+bold in the input field like all other `--` commands
+- **Tab completion** cycles through `--set nickname`, `--set autostart`, `--set list`
+- Partial input (e.g. `--se`, `--s`) tab-completes to `--set`
+
+#### Nickname sync fix
+- `--set nickname <name>` now propagates to the background agent process via a new `TypeSetNickname` IPC frame — chat messages from the student now show the correct nickname instead of the machine hostname
+
+#### Windows 7 compatibility
+- Added a **32-bit agent build** (`classsend-agent-win7-x86.exe`) compiled with **Go 1.20.14** — the last Go release to support Windows 7
+- Installer auto-detects the OS at install time: Win10+ x64 gets the native 64-bit agent; Win7/8, Win7 x64, and Win10 x86 get the 32-bit legacy agent
+- Single unified installer supports **Windows 7 SP1 through Windows 11**
+
+### Fixed
+- Blacklist / whitelist list mutation methods (`AddToBlacklist`, `RemoveBlacklistEntry`, `AddToWhitelist`, `RemoveWhitelistEntry`) now broadcast updated state to all connected students immediately after each change
+- Mutex deadlock in list mutation methods — explicit `Unlock()` before `broadcastState()` call instead of `defer`
+- `TypeShowCast` and `TypeSetNickname` IPC frames now handled in agent's `serveTUI()` loop
 
 ---
 
@@ -98,5 +139,6 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-[Unreleased]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/kalotrapezis/ClassSend2/releases/tag/v0.0.1
