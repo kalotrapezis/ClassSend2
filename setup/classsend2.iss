@@ -1,5 +1,5 @@
 #define MyAppName      "ClassSend 2"
-#define MyAppVersion   "0.0.3-o"
+#define MyAppVersion   "0.0.3"
 #define MyAppPublisher "ClassSend"
 
 ; ── Installer metadata ────────────────────────────────────────────────────────

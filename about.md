@@ -4,39 +4,46 @@
 
 ## Τρέχουσα έκδοση
 
-**v0.0.3-o**
+**v0.0.3** — πρώτη σταθερή release της 0.0.3 σειράς.
 
-### v0.0.3-o
+### Τι περιλαμβάνει
 
-- **Πλήρης ανάλυση οθόνης**: ο agent είναι πλέον DPI-aware. Σε οθόνες υψηλού DPI (π.χ. 125% scaling) το `GetSystemMetrics` δίνει πλέον τη φυσική ανάλυση, οπότε γίνεται capture όλη η επιφάνεια εργασίας — όχι μια μικρότερη, scaled-down εκδοχή.
-- **Cached back buffer στο monitoring**: το memory DC και το bitmap δημιουργούνται μία φορά και ανακατασκευάζονται μόνο όταν αλλάζει το μέγεθος του παραθύρου. Παλιά δημιουργούνταν 50+ φορές το δευτερόλεπτο κατά το resize, και η GDI κατάσταση «μπερδευόταν» — γι' αυτό το flicker.
+- **Παρακολούθηση οθονών**: grid με thumbnails, click σε cell για focus mode (υψηλή ανάλυση).
+- **Πλήρης ανάλυση capture**: ο agent είναι DPI-aware και πιάνει ολόκληρη την επιφάνεια εργασίας ακόμα και σε οθόνες με Windows scaling > 100%.
+- **Aspect-preserving display**: η οθόνη του μαθητή φαίνεται ολόκληρη χωρίς παραμόρφωση. Τα letterbox κενά γεμίζουν με το χρώμα του cell.
+- **Layout**: padded cells, εικόνα στην κορυφή, hostname κάτω από την εικόνα.
+- **Σταθερότητα pipe**: overlapped I/O ανάμεσα σε teacher και monitoring.exe με πραγματικά timeouts. Αντικαθιστά το παλιό σύγχρονο WriteFile που μπορούσε να «κολλήσει» επ' αόριστον.
+- **Σταθερότητα δικτύου**: 10 s write deadline στις TCP εγγραφές — αποτρέπει το «κόλλημα» όταν μαθητής έχει σπάσει τη σύνδεση χωρίς να το ξέρει το σύστημα.
+- **Cached back buffer στο monitoring**: το memory DC δημιουργείται μία φορά, όχι σε κάθε WM_PAINT — εξαφανίζει το flickering κατά το resize.
+- **Diagnostic logging**: κάθε βήμα στη διαδρομή screenshot έχει timing log. Αν κάτι πάει στραβά, η αιτία φαίνεται με μια ματιά στα logs.
+- **Bug reporting one-liner**: `--bug` ή `--report` φτιάχνει ένα zip με όλα τα σχετικά logs.
 
-### v0.0.3-n
+## Εντολές TUI
 
-### Τι άλλαξε
-
-- **Νέα διάταξη cell** στο monitoring: padding γύρω από κάθε cell, εικόνα στην κορυφή, hostname κάτω από την εικόνα. Κανένα μαύρο top bar.
-- **Διατήρηση aspect ratio**: η οθόνη του μαθητή φαίνεται ολόκληρη χωρίς παραμόρφωση. Τα letterbox κενά γεμίζουν με το χρώμα του cell, όχι μαύρο — δείχνει σαν προμελετημένο, όχι σαν bug.
-- **`SetDIBitsToDevice`** αντί για `StretchDIBits` στο 1:1 blit. Το `StretchDIBits` είχε ακόμα ένα GDI quirk: επιστρέφει 0 σιωπηλά κατά το γρήγορο resize παραθύρου. Το `SetDIBitsToDevice` δεν κουβαλάει stretch state και είναι σταθερό.
-- **Πραγματική διόρθωση του μαύρου τρεμοπαίγματος** στο focus mode (από v0.0.3-m): CPU-side resize και μετά 1:1 blit — το ίδιο GDI quirk δεν χτυπάει το 1:1 path.
-- **Υψηλότερη ανάλυση focus mode**: 1600px → 2400px στη μεγαλύτερη πλευρά, ποιότητα 70 → 80.
-- **Overlapped I/O στο named pipe** ανάμεσα σε teacher και monitoring.exe. Αντικαθιστά το παλιό σύγχρονο WriteFile/ReadFile που μπορούσε να «κολλήσει» επ' αόριστον. Τώρα κάθε pipe λειτουργία έχει timeout και ακυρώνεται καθαρά αν δεν ολοκληρωθεί.
-- Out buffer του pipe από 64 KB → 1 MB (αρκεί για χοντρά screenshots).
-- Διαγνωστική καταγραφή στις διαδρομές screenshot με timing για κάθε βήμα.
-- Write deadline 10 s στις TCP εγγραφές — αποτρέπει «κόλλημα» όταν μαθητής έχει σπάσει τη σύνδεση.
-- Dynamic about page: το αρχείο αυτό φορτώνεται ζωντανά από τον φάκελο εγκατάστασης, χωρίς rebuild.
-- `--ver` / `--version` / `--about` εντολές στο TUI και CLI.
-- Έκδοση εμφανίζεται στους τίτλους των παραθύρων.
-
-## Εντολές
-
-- `--about` — εμφανίζει αυτό το αρχείο
+- `--about` / `--ver` / `--version` — εμφανίζει αυτό το αρχείο και την ενεργή έκδοση
+- `--bug` / `--report` — δημιουργεί zip με logs στον φάκελο Downloads για αναφορά σφάλματος
 - `--coffee` — διάλειμμα ☕
 - `--matrix` — easter egg
-- `--t lock/unlock/mute/...` — εντολές συστήματος για μαθητές
+- `--t lock/unlock/mute/close/launch/focus/shutdown/tvon/tvoff/shot` — εντολές συστήματος προς μαθητές
 - `--set nickname <name>` — ορίζει όνομα
 - `--set list import/export` — μαύρες/άσπρες λίστες
+- `--clr @s` — καθαρίζει μηνύματα συστήματος
+
+## Αναφορά σφάλματος
+
+Αν κάτι δεν δουλεύει:
+
+1. Πληκτρολόγησε `--bug` στο TUI.
+2. Θα φτιαχτεί ένα zip στο `Downloads/classsend-bugreport-<timestamp>.zip` με όλα τα logs.
+3. Στείλε το zip στο: **kalotrapezis@gmail.com** με σύντομη περιγραφή του προβλήματος.
+
+Τα logs δεν περιέχουν προσωπικά δεδομένα — μόνο τεχνικές πληροφορίες για τη ροή των μηνυμάτων.
+
+## CLI flags
+
+- `teacher.exe --version` / `--ver` — εμφανίζει την έκδοση και κλείνει
+- `classsend-agent.exe --version` — όμοιο για τον agent
 
 ## Επικοινωνία
 
-ClassSend project · github.com/example/classsend
+kalotrapezis@gmail.com

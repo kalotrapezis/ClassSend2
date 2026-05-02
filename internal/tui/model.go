@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"archive/zip"
 	"fmt"
 	"math/rand"
 	"os"
@@ -764,6 +765,22 @@ func (m *Model) trySend() tea.Cmd {
 		} else {
 			m.pushSysMsg("(about.md δεν βρέθηκε δίπλα στο .exe)")
 		}
+		return nil
+	}
+
+	// --bug / --report — bundles every recent .log file from the install
+	// dir's logs/ folder into a single zip in Downloads, then tells the
+	// user where it is and how to share it. Goal: make "send me your logs"
+	// a 5-second copy-paste, not a 5-minute file hunt.
+	if text == "--bug" || text == "--report" {
+		zipPath, count, err := bundleBugReport()
+		if err != nil {
+			m.pushSysMsg("⚠ Δεν δημιουργήθηκε η αναφορά: " + err.Error())
+			return nil
+		}
+		m.pushSysMsg("📦 Αναφορά σφάλματος: " + zipPath)
+		m.pushSysMsg(fmt.Sprintf("   (%d αρχεία logs συμπεριλήφθηκαν, build=%s)", count, buildinfo.String()))
+		m.pushSysMsg("Στείλε το zip στο: kalotrapezis@gmail.com")
 		return nil
 	}
 	if text == "--matrix" {
@@ -2907,4 +2924,102 @@ func readAboutFile() (path, content string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+// bundleBugReport zips every .log next to the running .exe (the logs/ dir
+// devlog writes to) plus about.md if present, into a timestamped archive in
+// Downloads. Returns the absolute path of the zip, the number of log files
+// included, or an error. Designed for `--bug` / `--report` so a user with a
+// problem can share a single file instead of hunting through %APPDATA%.
+func bundleBugReport() (string, int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", 0, fmt.Errorf("locate exe: %w", err)
+	}
+	exeDir := filepath.Dir(exe)
+	logsDir := filepath.Join(exeDir, "logs")
+
+	// Pick the destination: %USERPROFILE%\Downloads if it exists, else home,
+	// else the install dir. Same fallback ladder as the export commands.
+	home, _ := os.UserHomeDir()
+	destDir := exeDir
+	if home != "" {
+		dl := filepath.Join(home, "Downloads")
+		if info, err := os.Stat(dl); err == nil && info.IsDir() {
+			destDir = dl
+		} else {
+			destDir = home
+		}
+	}
+
+	stamp := time.Now().Format("20060102-150405")
+	zipName := fmt.Sprintf("classsend-bugreport-%s.zip", stamp)
+	zipPath := filepath.Join(destDir, zipName)
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("create zip: %w", err)
+	}
+	defer zf.Close()
+
+	zw := zip.NewWriter(zf)
+	defer zw.Close()
+
+	// Copy each *.log file from the logs/ dir. Bundle the most recent N to
+	// keep the archive small even if logs have been accumulating for months.
+	const maxLogs = 30
+	logCount := 0
+	if entries, err := os.ReadDir(logsDir); err == nil {
+		// Sort newest-first so we ship the most relevant ones if we hit the cap.
+		sort.Slice(entries, func(i, j int) bool {
+			ii, _ := entries[i].Info()
+			jj, _ := entries[j].Info()
+			return ii.ModTime().After(jj.ModTime())
+		})
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".log") {
+				continue
+			}
+			if logCount >= maxLogs {
+				break
+			}
+			src := filepath.Join(logsDir, e.Name())
+			data, rerr := os.ReadFile(src)
+			if rerr != nil {
+				continue
+			}
+			w, werr := zw.Create("logs/" + e.Name())
+			if werr != nil {
+				continue
+			}
+			if _, werr := w.Write(data); werr == nil {
+				logCount++
+			}
+		}
+	}
+
+	// Include about.md so the report carries the running build's published
+	// description — useful when the file has been edited post-install.
+	if data, err := os.ReadFile(filepath.Join(exeDir, "about.md")); err == nil {
+		if w, werr := zw.Create("about.md"); werr == nil {
+			_, _ = w.Write(data)
+		}
+	}
+
+	// Add a small manifest so the recipient can see version, role, and where
+	// the report came from without unzipping every file.
+	manifest := fmt.Sprintf(
+		"ClassSend 2 bug report\nbuild: %s\nrole: (see startup line in any log)\nexe dir: %s\nlogs dir: %s\nlogs included: %d\ngenerated: %s\n",
+		buildinfo.String(), exeDir, logsDir, logCount, time.Now().Format(time.RFC3339))
+	if w, werr := zw.Create("MANIFEST.txt"); werr == nil {
+		_, _ = w.Write([]byte(manifest))
+	}
+
+	if err := zw.Close(); err != nil {
+		return "", 0, fmt.Errorf("close zip: %w", err)
+	}
+	if err := zf.Close(); err != nil {
+		return "", 0, fmt.Errorf("close file: %w", err)
+	}
+	return zipPath, logCount, nil
 }

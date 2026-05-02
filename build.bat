@@ -4,7 +4,7 @@ setlocal
 rem Single source of truth for the version. Bump the trailing letter on each
 rem rebuild so the user can tell which build the EXEs/installer came from.
 rem Must match setup\classsend2.iss MyAppVersion.
-set VERSION=0.0.3-o
+set VERSION=0.0.3
 
 rem ISO-8601 build timestamp via PowerShell (wmic is deprecated on modern Windows).
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'"`) do set BUILDTIME=%%I
