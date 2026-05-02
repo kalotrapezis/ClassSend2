@@ -142,7 +142,10 @@ func (s *Server) handleStudent(raw net.Conn) {
 	}
 }
 
-// Send sends a message to one student by ID
+// Send sends a message to one student by ID. If the underlying write fails
+// (timeout / broken pipe), the connection is closed so the read loop exits
+// and the student is evicted from the map — otherwise subsequent Send calls
+// would keep hitting the same dead conn.
 func (s *Server) Send(studentID string, msg protocol.Message) error {
 	s.mu.RLock()
 	student, ok := s.students[studentID]
@@ -150,7 +153,11 @@ func (s *Server) Send(studentID string, msg protocol.Message) error {
 	if !ok {
 		return fmt.Errorf("student %s not connected", studentID)
 	}
-	return student.conn.Send(msg)
+	if err := student.conn.Send(msg); err != nil {
+		student.conn.Close()
+		return err
+	}
+	return nil
 }
 
 // Broadcast sends a message to all connected students

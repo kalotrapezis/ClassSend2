@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 )
 
 // Message types
@@ -162,11 +164,21 @@ type PinPayload struct {
 	Pinned bool   `json:"pinned"`
 }
 
-// Conn wraps a net.Conn with buffered newline-delimited JSON read/write
+// Conn wraps a net.Conn with buffered newline-delimited JSON read/write.
+//
+// writeMu serializes Write calls so concurrent Send invocations from different
+// goroutines don't interleave bytes on the wire. WriteTimeout caps how long a
+// single Send blocks — without it, a half-open TCP socket (peer asleep / NAT
+// dropped state) freezes the caller until OS-level retransmit gives up, which
+// on Windows is many minutes. 10 s is generous for any single-message Send
+// (commands, chat, 32 KB file chunks) on a LAN.
 type Conn struct {
 	raw     net.Conn
 	scanner *bufio.Scanner
+	writeMu sync.Mutex
 }
+
+const WriteTimeout = 10 * time.Second
 
 func NewConn(c net.Conn) *Conn {
 	s := bufio.NewScanner(c)
@@ -180,7 +192,11 @@ func (c *Conn) Send(msg Message) error {
 		return err
 	}
 	b = append(b, '\n')
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.raw.SetWriteDeadline(time.Now().Add(WriteTimeout))
 	_, err = c.raw.Write(b)
+	_ = c.raw.SetWriteDeadline(time.Time{})
 	return err
 }
 

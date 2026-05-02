@@ -1,5 +1,5 @@
 #define MyAppName      "ClassSend 2"
-#define MyAppVersion   "0.0.2"
+#define MyAppVersion   "0.0.3-o"
 #define MyAppPublisher "ClassSend"
 
 ; ── Installer metadata ────────────────────────────────────────────────────────
@@ -55,6 +55,10 @@ Source: "..\dist\classsend-agent-win7-x86.exe";  DestDir: "{app}"; DestName: "cl
     Flags: ignoreversion; Check: IsDevRole and UseLegacyAgent
 Source: "..\monitoring.exe";                     DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
+
+; about.md ships next to every install. The TUI's --about reads this at
+; runtime, so its content can be edited post-install without rebuilding.
+Source: "..\about.md"; DestDir: "{app}"; Flags: ignoreversion
 
 ; ── Shortcuts ─────────────────────────────────────────────────────────────────
 [Icons]

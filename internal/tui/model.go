@@ -17,7 +17,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"classsend/internal/buildinfo"
 	"classsend/internal/core"
+	"classsend/internal/devlog"
 	"classsend/internal/protocol"
 )
 
@@ -120,6 +122,9 @@ func New(app *core.App) *Model {
 	ta.SetHeight(2)
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 500
+	// Disable the textarea's built-in Enter→newline binding. Enter is the send
+	// key in this app; we never want it to insert a newline into the buffer.
+	ta.KeyMap.InsertNewline.SetEnabled(false)
 
 	m := &Model{
 		app:         app,
@@ -183,10 +188,16 @@ func (m *Model) PushStudentLeave(id string) {
 }
 
 func (m *Model) Init() tea.Cmd {
+	role := string(m.app.Role)
+	if role != "" {
+		role = strings.ToUpper(role[:1]) + role[1:]
+	}
+	title := "ClassSend 2 — " + role + "  [" + buildinfo.String() + "]"
 	return tea.Batch(
 		m.spinner.Tick,
 		m.waitForEvent(),
 		m.input.Focus(),
+		tea.SetWindowTitle(title),
 	)
 }
 
@@ -304,7 +315,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	noOverlay := !m.toolsOpen && !toolsWereOpen && !m.filePickerOpen && !filePickerWasOpen && !m.helpOpen && !helpWasOpen && !m.listOpen && !listWasOpen
 	isEnter := func() bool {
 		k, ok := msg.(tea.KeyMsg)
-		return ok && k.String() == "enter"
+		if !ok {
+			return false
+		}
+		s := k.String()
+		return s == "enter" || s == "shift+enter" || s == "ctrl+j" || s == "ctrl+m"
 	}()
 	if m.focusInput && m.screen == screenChat && noOverlay && !isEnter {
 		var cmd tea.Cmd
@@ -712,9 +727,43 @@ func (m *Model) trySend() tea.Cmd {
 		return nil
 	}
 
+	// --mon / --monitor  shortcut for "--t tvon" — re-opens the monitoring
+	// window if the teacher closed it by mistake. Symmetric to --cast for
+	// students. Note: tvoff still works to stop monitoring.
+	if m.app.Role == core.RoleTeacher && (text == "--mon" || text == "--monitor") {
+		return m.handleToolCmd("tvon")
+	}
+
+	// --log  show the active session log path (or warn if logging is off)
+	if text == "--log" {
+		if p := devlog.Path(); p != "" {
+			m.pushSysMsg("📝 Log: " + p)
+		} else {
+			m.pushSysMsg("⚠ Logging απενεργοποιημένο ή απέτυχε η αρχικοποίηση")
+		}
+		return nil
+	}
+
 	// Easter eggs
 	if text == "--coffee" {
 		m.pushSysMsg("☕ Κάνε ένα διάλειμμα... αξίζεις έναν καφέ!")
+		return nil
+	}
+
+	// About / version. Reads about.md next to the running .exe so we can
+	// update the page after deployment without rebuilding. Falls back to a
+	// minimal one-liner if the file is missing.
+	if text == "--ver" || text == "--version" || text == "--about" {
+		m.pushSysMsg("ClassSend 2  •  " + buildinfo.String())
+		m.pushSysMsg("Ρόλος: " + string(m.app.Role) + "  •  Logs: " + devlog.Path())
+		if path, content, ok := readAboutFile(); ok {
+			m.pushSysMsg("── about.md (" + path + ") ──")
+			for _, line := range strings.Split(strings.TrimRight(content, "\r\n"), "\n") {
+				m.pushSysMsg(strings.TrimRight(line, "\r"))
+			}
+		} else {
+			m.pushSysMsg("(about.md δεν βρέθηκε δίπλα στο .exe)")
+		}
 		return nil
 	}
 	if text == "--matrix" {
@@ -745,10 +794,9 @@ func (m *Model) trySend() tea.Cmd {
 	if m.app.Role == core.RoleTeacher {
 		if tCmd, tHasArg, tArg := parseAliasCmd(text, "--t", "--tool"); tCmd {
 			if tHasArg {
-				m.handleToolCmd(tArg)
-			} else {
-				m.pushSysMsg("Χρήση: --t <lock|unlock|mute|…> [>N]  —  Tab για λίστα")
+				return m.handleToolCmd(tArg)
 			}
+			m.pushSysMsg("Χρήση: --t <lock|unlock|mute|…> [>N]  —  Tab για λίστα")
 			return nil
 		}
 	}
@@ -843,6 +891,14 @@ func (m *Model) trySend() tea.Cmd {
 		return nil
 	}
 
+	// Block unrecognised -- commands from being sent as chat messages.
+	// Without this, typing e.g. "--lock" falls through and broadcasts as
+	// a regular message to all students, piling up in the viewport.
+	if strings.HasPrefix(text, "--") {
+		m.pushSysMsg(fmt.Sprintf("⚠ Άγνωστη εντολή: %s  (--help για λίστα)", text))
+		return nil
+	}
+
 	m.app.SendChat(text)
 	if pinAfterSend {
 		if err := m.app.PinLastMessage(); err != nil {
@@ -855,11 +911,15 @@ func (m *Model) trySend() tea.Cmd {
 }
 
 // handleToolCmd parses: <action> [-a | -s <num>] [param]
-func (m *Model) handleToolCmd(raw string) {
+// Returns a tea.Cmd: nil for normal commands, tea.ClearScreen for actions
+// that spawn a subprocess (start-monitoring/tvon/stop-monitoring/tvoff). The
+// spawn briefly disrupts the Windows console state and bubbletea's incremental
+// renderer leaves stale rows on screen — ClearScreen forces a full repaint.
+func (m *Model) handleToolCmd(raw string) tea.Cmd {
 	parts := strings.Fields(raw)
 	if len(parts) == 0 {
 		m.pushSysMsg("Χρήση: --t <action> [-a | -s <num>] [param]  —  --help για λίστα")
-		return
+		return nil
 	}
 
 	actionCode := parts[0]
@@ -870,18 +930,18 @@ func (m *Model) handleToolCmd(raw string) {
 	case "start-casting", "cast", "caston":
 		if m.state.Casting {
 			m.pushSysMsg("⚠ Casting ήδη ενεργό — χρήση ^S ή --t stop-casting για διακοπή")
-			return
+			return nil
 		}
 		if _, err := m.app.StartCasting(); err != nil {
 			m.pushSysMsg("⚠ Casting: " + err.Error())
 		} else {
 			m.pushSysMsg("📡 Casting on")
 		}
-		return
+		return nil
 	case "stop-casting", "castoff":
 		m.app.StopCasting()
 		m.pushSysMsg("📡 Casting off")
-		return
+		return nil
 	}
 
 	// Resolve action code → protocol command
@@ -911,7 +971,7 @@ func (m *Model) handleToolCmd(raw string) {
 	entry, ok := actions[actionCode]
 	if !ok {
 		m.pushSysMsg(fmt.Sprintf("Άγνωστη εντολή: %s — --help για λίστα", actionCode))
-		return
+		return nil
 	}
 
 	// Parse target: @N for specific student, nothing = all
@@ -925,7 +985,7 @@ func (m *Model) handleToolCmd(raw string) {
 			num := 0
 			if _, err := fmt.Sscanf(strings.TrimPrefix(parts[i], ">"), "%d", &num); err != nil || num < 1 || num > len(m.students) {
 				m.pushSysMsg(fmt.Sprintf("Άκυρος στόχος: %s (1–%d)", parts[i], len(m.students)))
-				return
+				return nil
 			}
 			st := m.students[num-1]
 			targetID = st.id
@@ -939,7 +999,7 @@ func (m *Model) handleToolCmd(raw string) {
 
 	if entry.param && param == "" {
 		m.pushSysMsg(fmt.Sprintf("Η εντολή %s απαιτεί παράμετρο  π.χ. --t launch >2 notepad.exe", actionCode))
-		return
+		return nil
 	}
 
 	// Warn if targeting an offline student
@@ -947,16 +1007,29 @@ func (m *Model) handleToolCmd(raw string) {
 		for _, st := range m.students {
 			if st.id == targetID && !st.online {
 				m.pushSysMsg(fmt.Sprintf("⚠ %s δεν είναι συνδεδεμένος", targetLabel))
-				return
+				return nil
 			}
 		}
 	}
 
 	if err := m.app.SendCommand(entry.cmd, param, targetID); err != nil {
 		m.pushSysMsg("⚠ " + err.Error())
-		return
+		return nil
 	}
 	m.pushSysMsg(fmt.Sprintf("%s → %s", entry.label, targetLabel))
+
+	// tvon/tvoff spawn (or kill) monitoring.exe on the teacher side. The
+	// child-process churn briefly disrupts the Windows console mode and
+	// bubbletea's incremental renderer leaves stale rows on the terminal
+	// (the user sees their --t tvon / --t tvoff text "stuck" above the input
+	// box even though the textarea value is empty). A delayed ClearScreen
+	// forces a full repaint after the spawn settles.
+	if entry.cmd == protocol.CmdStartMonitor || entry.cmd == protocol.CmdStopMonitor {
+		return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
+			return tea.ClearScreen()
+		})
+	}
+	return nil
 }
 
 func (m *Model) executeSelectedTool() {
@@ -2484,6 +2557,8 @@ var knownCmdTokens = map[string]bool{
 	"--send": true,
 	"--set": true,
 	"--cast": true,
+	"--mon": true, "--monitor": true,
+	"--log": true,
 }
 
 // looksLikeCommand returns true when any whitespace-separated token exactly
@@ -2815,4 +2890,21 @@ func (m *Model) syncMessages(msgs []core.ChatMessage) {
 	}
 	m.messages = result
 	m.refreshViewport()
+}
+
+// readAboutFile finds about.md next to the running .exe (or in the cwd as
+// a fallback for `go run`) and returns its contents. The caller can update
+// the page in the install directory without rebuilding any binary.
+func readAboutFile() (path, content string, ok bool) {
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "about.md"))
+	}
+	candidates = append(candidates, "about.md")
+	for _, p := range candidates {
+		if data, err := os.ReadFile(p); err == nil {
+			return p, string(data), true
+		}
+	}
+	return "", "", false
 }

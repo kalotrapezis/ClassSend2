@@ -1549,6 +1549,23 @@ func (a *App) PushOpenFile(msgID, targetStudentID string) error {
 	return nil
 }
 
+// MarkMonitoringEnded clears the monitoring class-state flag and broadcasts.
+// Used by the teacher when the monitoring.exe session ends unexpectedly
+// (window closed by user, pipe broke, etc.) — without this, State.Monitoring
+// stays true and a subsequent --t tvon does nothing.
+func (a *App) MarkMonitoringEnded() {
+	a.mu.Lock()
+	wasOn := a.State.Monitoring
+	a.State.Monitoring = false
+	a.mu.Unlock()
+	if wasOn {
+		a.broadcastState()
+		if a.OnStateChange != nil {
+			a.OnStateChange(a.State)
+		}
+	}
+}
+
 // RequestShot sends a one-off screenshot request to a single student.
 // Lightweight: no state update or broadcast — just a targeted command.
 // StartCasting starts the dedicated cast server (via OnStartCasting hook),
@@ -1620,6 +1637,12 @@ func (a *App) StopCasting() {
 }
 
 func (a *App) RequestShot(studentID string) error {
+	return a.RequestShotParam(studentID, "")
+}
+
+// RequestShotParam sends a screenshot request with an optional param. Pass
+// "hi" for a higher-resolution capture (used by the teacher's focus mode).
+func (a *App) RequestShotParam(studentID, param string) error {
 	if a.Server == nil {
 		return fmt.Errorf("not a teacher")
 	}
@@ -1627,6 +1650,7 @@ func (a *App) RequestShot(studentID string) error {
 		CmdID:  newMsgID(),
 		Target: studentID,
 		Action: protocol.CmdRequestShot,
+		Param:  param,
 	})
 	if err != nil {
 		return err
