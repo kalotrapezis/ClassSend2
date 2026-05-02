@@ -10,7 +10,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"classsend/internal/buildinfo"
 	"classsend/internal/core"
+	"classsend/internal/devlog"
 	"classsend/internal/ipc"
 	"classsend/internal/monitoring"
 	"classsend/internal/network"
@@ -23,8 +25,20 @@ var defaultRole = "student"
 
 func main() {
 	role := flag.String("role", defaultRole, "Role: teacher or student")
-	dev  := flag.Bool("dev", false, "Dev mode: scan localhost (same-machine testing)")
+	dev := flag.Bool("dev", false, "Dev mode: scan localhost (same-machine testing)")
+	showVer := flag.Bool("version", false, "Print version and exit")
+	showVerShort := flag.Bool("ver", false, "Print version and exit (alias)")
 	flag.Parse()
+
+	if *showVer || *showVerShort {
+		fmt.Println("ClassSend 2  " + buildinfo.String())
+		fmt.Println("Role baked in: " + defaultRole)
+		os.Exit(0)
+	}
+
+	devlog.Init("classsend-" + *role)
+	defer devlog.Close()
+	devlog.Logf("startup  role=%s  dev=%v  build=%s  exe=%s", *role, *dev, buildinfo.String(), os.Args[0])
 
 	dataDir := dataDirectory()
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -98,7 +112,9 @@ func wireMonitoring(app *core.App) {
 	app.OnScreenshot = func(studentID string, jpegData []byte) {
 		select {
 		case shotCh <- monitoring.ShotMsg{StudentID: studentID, Data: jpegData}:
+			devlog.Logf("OnScreenshot: queued  student=%s jpeg=%dB chLen=%d", studentID, len(jpegData), len(shotCh))
 		default:
+			devlog.Logf("OnScreenshot: DROPPED (channel full)  student=%s jpeg=%dB", studentID, len(jpegData))
 		}
 	}
 
@@ -108,9 +124,11 @@ func wireMonitoring(app *core.App) {
 	)
 
 	app.OnMonitoringStart = func() {
+		devlog.Logf("OnMonitoringStart fired")
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
 		if sessionStop != nil {
+			devlog.Logf("OnMonitoringStart: session already running, skip")
 			return
 		}
 
@@ -127,19 +145,36 @@ func wireMonitoring(app *core.App) {
 			return out
 		}
 
-		sendCmd := func(studentID string) error {
-			return app.RequestShot(studentID)
+		sendCmd := func(studentID, param string) error {
+			return app.RequestShotParam(studentID, param)
 		}
 
-		stop, err := monitoring.StartSession(getStudents, sendCmd, shotCh, findMonitoringExe())
+		exePath := findMonitoringExe()
+		devlog.Logf("monitoring: StartSession exePath=%s", exePath)
+
+		// onEnded fires when the session goroutine returns — usually because
+		// the user closed the monitoring window. Without resetting state, a
+		// subsequent --t tvon would no-op because State.Monitoring stays true.
+		onEnded := func() {
+			devlog.Logf("monitoring: session ended, clearing state")
+			sessionMu.Lock()
+			sessionStop = nil
+			sessionMu.Unlock()
+			app.MarkMonitoringEnded()
+		}
+
+		stop, err := monitoring.StartSession(getStudents, sendCmd, shotCh, exePath, onEnded)
 		if err != nil {
+			devlog.Logf("monitoring: StartSession FAILED: %v", err)
 			log.Printf("monitoring: %v", err)
 			return
 		}
+		devlog.Logf("monitoring: StartSession ok")
 		sessionStop = stop
 	}
 
 	app.OnMonitoringStop = func() {
+		devlog.Logf("OnMonitoringStop fired")
 		sessionMu.Lock()
 		defer sessionMu.Unlock()
 		if sessionStop != nil {

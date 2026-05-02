@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	"classsend/internal/core"
+	"classsend/internal/devlog"
 	"classsend/internal/network"
 	"classsend/internal/protocol"
 )
@@ -35,6 +36,7 @@ var (
 	procGetDC                  = user32.NewProc("GetDC")
 	procReleaseDC              = user32.NewProc("ReleaseDC")
 	procGetSystemMetrics       = user32.NewProc("GetSystemMetrics")
+	procSetProcessDPIAware     = user32.NewProc("SetProcessDPIAware")
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
 	procSelectObject           = gdi32.NewProc("SelectObject")
@@ -67,20 +69,23 @@ var (
 	procRegCloseKey      = advapi32.NewProc("RegCloseKey")
 
 	// GDI drawing
-	procBeginPaint       = user32.NewProc("BeginPaint")
-	procEndPaint         = user32.NewProc("EndPaint")
-	procGetClientRect    = user32.NewProc("GetClientRect")
-	procFillRect         = user32.NewProc("FillRect")
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procSetTextColor     = gdi32.NewProc("SetTextColor")
-	procSetBkMode        = gdi32.NewProc("SetBkMode")
-	procDrawTextW        = user32.NewProc("DrawTextW")
-	procCreateFontW      = gdi32.NewProc("CreateFontW")
-	procInvalidateRect   = user32.NewProc("InvalidateRect")
-	procDestroyWindow    = user32.NewProc("DestroyWindow")
-	procIsZoomed         = user32.NewProc("IsZoomed")
-	procSetDIBits        = gdi32.NewProc("SetDIBits")
-	procStretchBlt       = gdi32.NewProc("StretchBlt")
+	procBeginPaint          = user32.NewProc("BeginPaint")
+	procEndPaint            = user32.NewProc("EndPaint")
+	procGetClientRect       = user32.NewProc("GetClientRect")
+	procFillRect            = user32.NewProc("FillRect")
+	procCreateSolidBrush    = gdi32.NewProc("CreateSolidBrush")
+	procSetTextColor        = gdi32.NewProc("SetTextColor")
+	procSetBkMode           = gdi32.NewProc("SetBkMode")
+	procDrawTextW           = user32.NewProc("DrawTextW")
+	procCreateFontW         = gdi32.NewProc("CreateFontW")
+	procInvalidateRect      = user32.NewProc("InvalidateRect")
+	procDestroyWindow       = user32.NewProc("DestroyWindow")
+	procIsZoomed            = user32.NewProc("IsZoomed")
+	procSetDIBits           = gdi32.NewProc("SetDIBits")
+	procStretchBlt          = gdi32.NewProc("StretchBlt")
+	procStretchDIBits       = gdi32.NewProc("StretchDIBits")
+	procSetStretchBltMode   = gdi32.NewProc("SetStretchBltMode")
+	procSetBrushOrgEx       = gdi32.NewProc("SetBrushOrgEx")
 
 	// Keyboard hook
 	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
@@ -96,6 +101,8 @@ var (
 	procIsWindowVisible = user32.NewProc("IsWindowVisible")
 	procGetWindowTextW  = user32.NewProc("GetWindowTextW")
 	procGetClassNameW   = user32.NewProc("GetClassNameW")
+
+	procLoadCursorW = user32.NewProc("LoadCursorW")
 )
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -116,6 +123,7 @@ const (
 
 	wmDestroy      = 0x0002
 	wmPaint        = 0x000F
+	wmSize         = 0x0005
 	wmClose        = 0x0010
 	wmKeydown      = 0x0100
 	wmSyskeydown   = 0x0104
@@ -143,6 +151,9 @@ const (
 	dtLeft       = 0x00000000
 
 	transparent = 1 // SetBkMode TRANSPARENT
+	// HALFTONE silently returns 0 from StretchDIBits after the first call
+	// on memory DCs with non-integer scale ratios. COLORONCOLOR is reliable.
+	colorOnColor = 3
 
 	whKeyboardLl = 13
 	hcAction      = 0
@@ -245,7 +256,32 @@ func init() {
 
 // ── Screen capture ────────────────────────────────────────────────────────────
 
-func captureScreen() ([]byte, error) {
+// dpiAwareOnce ensures we tell Windows we want physical pixels exactly once.
+// Without this, Go's default DPI-unaware mode makes GetSystemMetrics return
+// the logical (scaled-down) resolution on hi-DPI displays — the captured
+// screenshot is then a downscaled fragment of the real desktop. After we
+// declare DPI awareness, GetSystemMetrics returns the full pixel count and
+// BitBlt of the desktop captures everything visible to the user.
+var dpiAwareOnce sync.Once
+
+func ensureDPIAware() {
+	dpiAwareOnce.Do(func() {
+		procSetProcessDPIAware.Call()
+	})
+}
+
+// captureScreen takes a default thumbnail-sized JPEG (used in normal monitoring).
+func captureScreen() ([]byte, error) { return captureScreenSized(640, 50) }
+
+// captureScreenHi takes a higher-resolution JPEG for the teacher's focus mode.
+// 2400px on the longer edge with quality 80 — text on the student's screen
+// stays readable on a 1080p+ teacher monitor. ~120-200 KB per frame on
+// typical desktops, still well under the 1 MB pipe buffer.
+func captureScreenHi() ([]byte, error) { return captureScreenSized(2400, 80) }
+
+func captureScreenSized(maxEdge int, quality int) ([]byte, error) {
+	ensureDPIAware()
+
 	desktop, _, _ := procGetDesktopWindow.Call()
 	hdcScreen, _, _ := procGetDC.Call(desktop)
 	defer procReleaseDC.Call(desktop, hdcScreen)
@@ -285,11 +321,55 @@ func captureScreen() ([]byte, error) {
 	}
 
 	img := &image.NRGBA{Pix: raw, Stride: int(w) * 4, Rect: image.Rect(0, 0, int(w), int(h))}
+
+	// Downscale before JPEG encode. Caller picks maxEdge: 640 for thumbnails,
+	// 1600 for focus mode (text-readable).
+	small := downscaleNRGBA(img, maxEdge)
+
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 40}); err != nil {
+	if err := jpeg.Encode(&buf, small, &jpeg.Options{Quality: quality}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// downscaleNRGBA returns a smaller copy of src such that its longer edge is
+// at most maxEdge pixels. Aspect ratio preserved. Uses a fast box-filter
+// (averaging) when the scale is integer, falling back to nearest-neighbour
+// otherwise. No external deps.
+func downscaleNRGBA(src *image.NRGBA, maxEdge int) *image.NRGBA {
+	srcW := src.Rect.Dx()
+	srcH := src.Rect.Dy()
+	longest := srcW
+	if srcH > longest {
+		longest = srcH
+	}
+	if longest <= maxEdge {
+		return src
+	}
+	scale := float64(maxEdge) / float64(longest)
+	dstW := int(float64(srcW) * scale)
+	dstH := int(float64(srcH) * scale)
+	dst := image.NewNRGBA(image.Rect(0, 0, dstW, dstH))
+
+	// Nearest-neighbour: fast enough for screen captures, quality is fine
+	// at thumbnail size.
+	xRatio := float64(srcW) / float64(dstW)
+	yRatio := float64(srcH) / float64(dstH)
+	for y := 0; y < dstH; y++ {
+		sy := int(float64(y) * yRatio)
+		srcRow := src.Pix[sy*src.Stride:]
+		dstRow := dst.Pix[y*dst.Stride:]
+		for x := 0; x < dstW; x++ {
+			sx := int(float64(x) * xRatio)
+			off := sx * 4
+			dstRow[x*4+0] = srcRow[off+0]
+			dstRow[x*4+1] = srcRow[off+1]
+			dstRow[x*4+2] = srcRow[off+2]
+			dstRow[x*4+3] = srcRow[off+3]
+		}
+	}
+	return dst
 }
 
 // ── Mute toggle ───────────────────────────────────────────────────────────────
@@ -737,7 +817,10 @@ var (
 func castViewWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmCastNewFrame:
-		procInvalidateRect.Call(hwnd, 0, 1)
+		procInvalidateRect.Call(hwnd, 0, 0)
+		return 0
+	case wmSize:
+		procInvalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmCastClose:
 		// Teacher stopped cast — hide the window (keep alive for reuse)
@@ -797,44 +880,64 @@ func drawCastFrame(hwnd uintptr) {
 
 	var rc winRect
 	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+	winW, winH := rc.Right, rc.Bottom
 
-	// Black background in case frame hasn't arrived yet
+	// Back-buffer at window size — we draw everything here, then BitBlt
+	// to the screen DC in one atomic call, eliminating the black flash.
+	hdcBack, _, _ := procCreateCompatibleDC.Call(hdc)
+	hBmpBack, _, _ := procCreateCompatibleBitmap.Call(hdc, uintptr(winW), uintptr(winH))
+	oldBack, _, _ := procSelectObject.Call(hdcBack, hBmpBack)
+
+	// Black background
 	bg, _, _ := procCreateSolidBrush.Call(0)
-	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), bg)
+	procFillRect.Call(hdcBack, uintptr(unsafe.Pointer(&rc)), bg)
 	procDeleteObject.Call(bg)
 
-	if len(pix) == 0 || fw == 0 || fh == 0 {
-		return
+	if len(pix) > 0 && fw > 0 && fh > 0 {
+		// Letterbox: scale to fit while preserving aspect ratio
+		scaleX := float64(winW) / float64(fw)
+		scaleY := float64(winH) / float64(fh)
+		scale := scaleX
+		if scaleY < scaleX {
+			scale = scaleY
+		}
+		dstW := int32(float64(fw) * scale)
+		dstH := int32(float64(fh) * scale)
+		dstX := (winW - dstW) / 2
+		dstY := (winH - dstH) / 2
+
+		// StretchDIBits goes straight from the DIB pixel buffer into the back-
+		// buffer DC. Avoids the SetDIBits-on-selected-bitmap pitfall that was
+		// blanking every frame after the first.
+		bi := bitmapInfoHeader{
+			biSize:        40,
+			biWidth:       int32(fw),
+			biHeight:      -int32(fh), // top-down DIB
+			biPlanes:      1,
+			biBitCount:    32,
+			biCompression: biRgb,
+		}
+		procSetStretchBltMode.Call(hdcBack, uintptr(colorOnColor))
+		ret, _, callErr := procStretchDIBits.Call(
+			hdcBack,
+			uintptr(dstX), uintptr(dstY), uintptr(dstW), uintptr(dstH),
+			0, 0, uintptr(fw), uintptr(fh),
+			uintptr(unsafe.Pointer(&pix[0])),
+			uintptr(unsafe.Pointer(&bi)),
+			dibRgbColors,
+			srcCopy,
+		)
+		devlog.Logf("cast paint  src=%dx%d  dst=%dx%d  win=%dx%d  ret=%d  err=%v",
+			fw, fh, dstW, dstH, winW, winH, int32(ret), callErr)
+	} else {
+		devlog.Logf("cast paint SKIPPED  pix=%d  fw=%d  fh=%d", len(pix), fw, fh)
 	}
 
-	bi := bitmapInfoHeader{
-		biSize:        40,
-		biWidth:       int32(fw),
-		biHeight:      -int32(fh), // top-down DIB
-		biPlanes:      1,
-		biBitCount:    32,
-		biCompression: biRgb,
-	}
-
-	hdcMem, _, _ := procCreateCompatibleDC.Call(hdc)
-	defer procDeleteDC.Call(hdcMem)
-
-	hBmp, _, _ := procCreateCompatibleBitmap.Call(hdc, uintptr(fw), uintptr(fh))
-	defer procDeleteObject.Call(hBmp)
-
-	procSelectObject.Call(hdcMem, hBmp)
-	procSetDIBits.Call(
-		hdcMem, hBmp, 0, uintptr(fh),
-		uintptr(unsafe.Pointer(&pix[0])),
-		uintptr(unsafe.Pointer(&bi)),
-		dibRgbColors,
-	)
-	// StretchBlt fills the fullscreen window; HALFTONE for high-quality downscale
-	procStretchBlt.Call(
-		hdc, 0, 0, uintptr(rc.Right), uintptr(rc.Bottom),
-		hdcMem, 0, 0, uintptr(fw), uintptr(fh),
-		srcCopy,
-	)
+	// Atomic transfer to screen
+	procBitBlt.Call(hdc, 0, 0, uintptr(winW), uintptr(winH), hdcBack, 0, 0, srcCopy)
+	procSelectObject.Call(hdcBack, oldBack)
+	procDeleteObject.Call(hBmpBack)
+	procDeleteDC.Call(hdcBack)
 }
 
 // updateCastFrame decodes a JPEG frame and signals the Win32 window to repaint.
@@ -867,6 +970,8 @@ func updateCastFrame(jpegData []byte) {
 	castViewMu.Lock()
 	hwnd := castViewHwnd
 	castViewMu.Unlock()
+	devlog.Logf("cast frame  %dx%d  jpeg=%dB  bgra=%dB  hwnd=%v",
+		w, h, len(jpegData), len(pix), hwnd != 0)
 	if hwnd != 0 {
 		procPostMessageW.Call(hwnd, wmCastNewFrame, 0, 0)
 	}
@@ -938,11 +1043,16 @@ func runCastViewWindow(hwndOut chan<- uintptr) {
 	hInst, _, _ := procGetModuleHandleW.Call(0)
 	className := utf16("ClassSendCastView")
 
+	// IDC_ARROW = 32512. Without an hCursor set, Windows shows the wait
+	// cursor permanently because no default exists.
+	arrowCursor, _, _ := procLoadCursorW.Call(0, uintptr(32512))
+
 	wc := wndClassExW{
 		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
-		style:         csHredraw | csVredraw,
+		style:         0,
 		lpfnWndProc:   castViewProcCB,
 		hInstance:     hInst,
+		hCursor:       arrowCursor,
 		hbrBackground: 0,
 		lpszClassName: className,
 	}
@@ -1198,9 +1308,19 @@ func setupStudentCommands(app *core.App, devMode bool) {
 			StudentID: app.Hostname,
 			Data:      data,
 		})
-		if err == nil && app.Client != nil {
-			app.Client.Send(msg) //nolint:errcheck
+		if err != nil {
+			devlog.Logf("sendShot encode failed: %v", err)
+			return
 		}
+		if app.Client == nil {
+			devlog.Logf("sendShot DROPPED: app.Client is nil  jpeg=%dB", len(data))
+			return
+		}
+		if sendErr := app.Client.Send(msg); sendErr != nil {
+			devlog.Logf("sendShot send failed: %v  jpeg=%dB", sendErr, len(data))
+			return
+		}
+		devlog.Logf("sendShot ok  jpeg=%dB", len(data))
 	}
 
 	report := func(cmd protocol.CommandPayload, err error) {
@@ -1273,11 +1393,26 @@ func setupStudentCommands(app *core.App, devMode bool) {
 			hideCastingViewer()
 
 		case protocol.CmdRequestShot:
-			go func() {
-				if data, err := captureScreen(); err == nil {
-					sendShot(data)
+			// Param "hi" => high-res capture for the teacher's focus mode.
+			// Empty / anything else => normal thumbnail.
+			hires := cmd.Param == "hi"
+			devlog.Logf("CmdRequestShot received  hi=%v", hires)
+			go func(hi bool) {
+				var (
+					data []byte
+					err  error
+				)
+				if hi {
+					data, err = captureScreenHi()
+				} else {
+					data, err = captureScreen()
 				}
-			}()
+				if err != nil {
+					devlog.Logf("captureScreen failed: %v  hi=%v", err, hi)
+					return
+				}
+				sendShot(data)
+			}(hires)
 		}
 	}
 }

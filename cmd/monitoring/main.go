@@ -22,10 +22,14 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"classsend/internal/buildinfo"
+	"classsend/internal/devlog"
 )
 
 // ── Win32 API bindings ────────────────────────────────────────────────────────
@@ -50,6 +54,7 @@ var (
 	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 	procSetWindowTextW   = user32.NewProc("SetWindowTextW")
+	procLoadCursorW      = user32.NewProc("LoadCursorW")
 
 	// Painting / GDI
 	procBeginPaint             = user32.NewProc("BeginPaint")
@@ -60,6 +65,9 @@ var (
 	procDeleteObject           = gdi32.NewProc("DeleteObject")
 	procDeleteDC               = gdi32.NewProc("DeleteDC")
 	procBitBlt                 = gdi32.NewProc("BitBlt")
+	procSetDIBits              = gdi32.NewProc("SetDIBits")
+	procSetDIBitsToDevice      = gdi32.NewProc("SetDIBitsToDevice")
+	procStretchBlt             = gdi32.NewProc("StretchBlt")
 	procStretchDIBits          = gdi32.NewProc("StretchDIBits")
 	procFillRect               = user32.NewProc("FillRect")
 	procCreateSolidBrush       = gdi32.NewProc("CreateSolidBrush")
@@ -70,11 +78,18 @@ var (
 	procSetStretchBltMode      = gdi32.NewProc("SetStretchBltMode")
 	procSetBrushOrgEx          = gdi32.NewProc("SetBrushOrgEx")
 
-	// Named pipe (client side)
-	procCreateFileW    = kernel32.NewProc("CreateFileW")
-	procReadFile       = kernel32.NewProc("ReadFile")
-	procCloseHandle    = kernel32.NewProc("CloseHandle")
-	procWaitNamedPipe  = kernel32.NewProc("WaitNamedPipeW")
+	// Named pipe (client side) — overlapped I/O on the data path so a wedged
+	// read or write can be cancelled instead of freezing the whole process.
+	procCreateFileW         = kernel32.NewProc("CreateFileW")
+	procReadFile            = kernel32.NewProc("ReadFile")
+	procWriteFile           = kernel32.NewProc("WriteFile")
+	procCloseHandle         = kernel32.NewProc("CloseHandle")
+	procWaitNamedPipe       = kernel32.NewProc("WaitNamedPipeW")
+	procCreateEventW        = kernel32.NewProc("CreateEventW")
+	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
+	procCancelIoEx          = kernel32.NewProc("CancelIoEx")
+	procGetOverlappedResult = kernel32.NewProc("GetOverlappedResult")
+	procResetEvent          = kernel32.NewProc("ResetEvent")
 )
 
 // ── Win32 constants ───────────────────────────────────────────────────────────
@@ -88,18 +103,32 @@ const (
 	smCxScreen         = 0
 	smCyScreen         = 1
 
-	wmDestroy = 0x0002
-	wmPaint   = 0x000F
-	wmSize    = 0x0005
-	wmClose   = 0x0010
-	wmUser    = 0x0400
-	wmUpdate  = wmUser + 1 // custom: grid data changed — repaint
-	wmPipeEOF = wmUser + 2 // custom: pipe closed by classsend
+	wmDestroy      = 0x0002
+	wmPaint        = 0x000F
+	wmSize         = 0x0005
+	wmClose        = 0x0010
+	wmKeydown      = 0x0100
+	wmLbuttondown  = 0x0201
+	wmUser         = 0x0400
+	wmUpdate       = wmUser + 1 // custom: grid data changed — repaint
+	wmPipeEOF      = wmUser + 2 // custom: pipe closed by classsend
+
+	vkEscape = 0x1B
+
+	// Pipe protocol — back-channel (monitoring → classsend)
+	msgFocus uint32 = 5
+
+	// Sentinel: leave focus mode and resume the grid round-robin.
+	focusUnset uint32 = 0xFFFFFFFF
 
 	srcCopy      = 0x00CC0020
 	dibRgbColors = 0
 	transparent  = 1
-	halftone     = 4 // HALFTONE stretch mode for quality downscaling
+	// HALFTONE (4) silently returns 0 for every StretchDIBits after the
+	// first when the destination is a memory DC with non-integer scaling
+	// — observed on real hardware, confirmed in logs. COLORONCOLOR (3) is
+	// the safe choice; quality difference is invisible at thumbnail size.
+	colorOnColor = 3
 
 	dtCenter    = 0x00000001
 	dtVcenter   = 0x00000004
@@ -107,10 +136,17 @@ const (
 	dtWordBreak  = 0x00000010
 	dtLeft       = 0x00000000
 
-	genericRead     = 0x80000000
-	openExisting    = 3
-	fileAttrNormal  = 0x00000080
-	invalidHandle   = ^uintptr(0)
+	genericRead        = 0x80000000
+	genericWrite       = 0x40000000
+	openExisting       = 3
+	fileAttrNormal     = 0x00000080
+	fileFlagOverlapped = 0x40000000
+	invalidHandle      = ^uintptr(0)
+
+	errorIoPending = 997
+	waitObject0    = 0x00000000
+	waitTimeout    = 0x00000102
+	infinite       = 0xFFFFFFFF
 
 	// Pipe protocol types — must match session_windows.go
 	msgInit    uint32 = 1
@@ -172,10 +208,6 @@ type bitmapInfoHeader struct {
 	biClrImportant  uint32
 }
 
-type bitmapInfo struct {
-	bmiHeader bitmapInfoHeader
-	bmiColors [1]uint32
-}
 
 // ── Grid state ────────────────────────────────────────────────────────────────
 
@@ -193,6 +225,16 @@ var (
 	mainHwnd uintptr
 
 	wndProcCallback uintptr
+
+	// Pipe handle for the back-channel (monitoring → classsend) — set once
+	// the readPipe goroutine has CreateFile'd it. Click handlers use it to
+	// send MsgFocus events.
+	pipeMu      sync.Mutex
+	pipeHandle  uintptr
+
+	// Focus state: -1 = grid mode, otherwise index of the focused cell.
+	focusMu  sync.RWMutex
+	focusIdx int = -1
 )
 
 func init() {
@@ -201,21 +243,61 @@ func init() {
 
 // ── Window procedure ──────────────────────────────────────────────────────────
 
-func monitorWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+func monitorWndProc(hwnd, msg, wParam, lParam uintptr) (ret uintptr) {
+	defer func() {
+		if r := recover(); r != nil {
+			devlog.Logf("wndProc PANIC msg=0x%x: %v\n%s", msg, r, debug.Stack())
+			ret = 0
+		}
+	}()
 	switch msg {
 	case wmPaint:
 		paintGrid(hwnd)
 		return 0
 	case wmSize:
-		procInvalidateRect.Call(hwnd, 0, 1)
+		procInvalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmUpdate:
 		procInvalidateRect.Call(hwnd, 0, 0)
 		return 0
+	case wmLbuttondown:
+		// Hit-test: which cell did we click? Toggle focus.
+		x := int32(int16(lParam & 0xFFFF))
+		y := int32(int16((lParam >> 16) & 0xFFFF))
+		idx := hitTestCell(hwnd, x, y)
+		if idx < 0 {
+			return 0
+		}
+		focusMu.Lock()
+		var send uint32
+		if focusIdx == idx {
+			focusIdx = -1
+			send = focusUnset
+		} else {
+			focusIdx = idx
+			send = uint32(idx)
+		}
+		focusMu.Unlock()
+		sendFocusBackChannel(send)
+		procInvalidateRect.Call(hwnd, 0, 0)
+		return 0
+	case wmKeydown:
+		// Esc leaves focus mode.
+		if wParam == vkEscape {
+			focusMu.Lock()
+			wasFocused := focusIdx >= 0
+			focusIdx = -1
+			focusMu.Unlock()
+			if wasFocused {
+				sendFocusBackChannel(focusUnset)
+				procInvalidateRect.Call(hwnd, 0, 0)
+			}
+		}
+		return 0
 	case wmPipeEOF:
 		// classsend closed the pipe (monitoring stopped or crashed)
 		procSetWindowTextW.Call(hwnd,
-			uintptr(unsafe.Pointer(utf16("ClassSend - Παρακολούθηση (Εκτός Σύνδεσης)"))))
+			uintptr(unsafe.Pointer(utf16("ClassSend - Παρακολούθηση (Εκτός Σύνδεσης)  ["+buildinfo.String()+"]"))))
 		procInvalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmClose, wmDestroy:
@@ -226,29 +308,118 @@ func monitorWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	return r
 }
 
+// hitTestCell returns the cell index at window coords (x,y), or -1 if the
+// click was on padding or outside the grid.
+func hitTestCell(hwnd uintptr, x, y int32) int {
+	var rc winRect
+	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+	winW, winH := rc.Right, rc.Bottom
+
+	gridMu.RLock()
+	n := len(cells)
+	gridMu.RUnlock()
+	if n == 0 || winW <= 0 || winH <= 0 {
+		return -1
+	}
+
+	cols := int32(math.Ceil(math.Sqrt(float64(n))))
+	rows := (int32(n) + cols - 1) / cols
+	cellW := winW / cols
+	cellH := winH / rows
+	if cellW <= 0 || cellH <= 0 {
+		return -1
+	}
+	col := x / cellW
+	row := y / cellH
+	idx := int(row*cols + col)
+	if idx < 0 || idx >= n {
+		return -1
+	}
+	return idx
+}
+
+// sendFocusBackChannel writes a MsgFocus message to the duplex pipe so the
+// teacher's session loop can switch between grid and focus polling. Runs on
+// the UI thread (called from wmLbuttondown), so it MUST NOT block the
+// message pump — overlapped I/O with a 2 s timeout guarantees that.
+func sendFocusBackChannel(idx uint32) {
+	pipeMu.Lock()
+	h := pipeHandle
+	pipeMu.Unlock()
+	if h == 0 {
+		devlog.Logf("focus click: no pipe handle yet, dropping")
+		return
+	}
+	frame := make([]byte, 12)
+	binary.LittleEndian.PutUint32(frame[0:4], msgFocus)
+	binary.LittleEndian.PutUint32(frame[4:8], 4)
+	binary.LittleEndian.PutUint32(frame[8:12], idx)
+	op, err := newPipeOp()
+	if err != nil {
+		devlog.Logf("focus click: newPipeOp: %v", err)
+		return
+	}
+	defer op.close()
+	if err := pipeWriteAll(h, op, frame, 2*time.Second); err != nil {
+		devlog.Logf("focus click: write failed: %v", err)
+		return
+	}
+	if idx == focusUnset {
+		devlog.Logf("focus click: sent UNFOCUS")
+	} else {
+		devlog.Logf("focus click: sent FOCUS idx=%d", idx)
+	}
+}
+
 // ── Painting ──────────────────────────────────────────────────────────────────
 
-const nameBarH = int32(24)
+// Back-buffer state, cached across paints. Recreating the memory DC and
+// compatible bitmap on every WM_PAINT (50+ Hz during a window resize) was
+// trashing GDI state — SetDIBitsToDevice/StretchDIBits returned 0 on
+// random frames. Caching them eliminates the churn.
+var (
+	bbHdc    uintptr
+	bbBmp    uintptr
+	bbOldBmp uintptr
+	bbW      int32
+	bbH      int32
+)
+
+// ensureBackBuffer (re)creates the cached memory DC + bitmap if the window
+// size changed. Called from paintGrid; safe to call repeatedly.
+func ensureBackBuffer(hdc uintptr, w, h int32) {
+	if bbHdc != 0 && bbW == w && bbH == h {
+		return
+	}
+	if bbHdc != 0 {
+		procSelectObject.Call(bbHdc, bbOldBmp)
+		procDeleteObject.Call(bbBmp)
+		procDeleteDC.Call(bbHdc)
+		bbHdc, bbBmp, bbOldBmp = 0, 0, 0
+	}
+	bbHdc, _, _ = procCreateCompatibleDC.Call(hdc)
+	bbBmp, _, _ = procCreateCompatibleBitmap.Call(hdc, uintptr(w), uintptr(h))
+	bbOldBmp, _, _ = procSelectObject.Call(bbHdc, bbBmp)
+	bbW, bbH = w, h
+}
 
 func paintGrid(hwnd uintptr) {
 	var ps paintStruct
 	hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	devlog.Logf("paintGrid  cells=%d", func() int { gridMu.RLock(); defer gridMu.RUnlock(); return len(cells) }())
 
 	var rc winRect
 	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
 	winW := rc.Right
 	winH := rc.Bottom
 
-	// Double-buffer: draw everything into a memory DC then BitBlt to screen
-	hdcMem, _, _ := procCreateCompatibleDC.Call(hdc)
-	hBmp, _, _ := procCreateCompatibleBitmap.Call(hdc, uintptr(winW), uintptr(winH))
-	oldBmp, _, _ := procSelectObject.Call(hdcMem, hBmp)
+	// Double-buffer with a CACHED memory DC + bitmap. Only recreated on size
+	// change. The final defer just blits the back buffer to the screen.
+	ensureBackBuffer(hdc, winW, winH)
+	hdcMem := bbHdc
 	defer func() {
 		procBitBlt.Call(hdc, 0, 0, uintptr(winW), uintptr(winH), hdcMem, 0, 0, srcCopy)
-		procSelectObject.Call(hdcMem, oldBmp)
-		procDeleteObject.Call(hBmp)
-		procDeleteDC.Call(hdcMem)
 	}()
 
 	// Background
@@ -261,6 +432,39 @@ func paintGrid(hwnd uintptr) {
 	snapshot := make([]cellState, len(cells))
 	copy(snapshot, cells)
 	gridMu.RUnlock()
+
+	focusMu.RLock()
+	curFocus := focusIdx
+	focusMu.RUnlock()
+
+	// Focus mode: paint just the focused cell, full window.
+	if curFocus >= 0 && curFocus < len(snapshot) {
+		hFont, _, _ := procCreateFontW.Call(
+			i32(-14), 0, 0, 0,
+			600, 0, 0, 0,
+			1, 0, 0, 4, 0,
+			uintptr(unsafe.Pointer(utf16("Segoe UI"))),
+		)
+		origFont, _, _ := procSelectObject.Call(hdcMem, hFont)
+		procSetStretchBltMode.Call(hdcMem, uintptr(colorOnColor))
+		paintCell(hdcMem, 0, 0, winW, winH, &snapshot[curFocus])
+
+		// Top-right exit hint badge so the user knows how to leave focus mode.
+		hint := utf16("  Esc ή κλικ για έξοδο  ")
+		const hintW, hintH = int32(220), int32(28)
+		hintRc := winRect{winW - hintW - 12, 12, winW - 12, 12 + hintH}
+		hintBg, _, _ := procCreateSolidBrush.Call(0x00CC2222) // BGR red
+		procFillRect.Call(hdcMem, uintptr(unsafe.Pointer(&hintRc)), hintBg)
+		procDeleteObject.Call(hintBg)
+		procSetBkMode.Call(hdcMem, uintptr(transparent))
+		procSetTextColor.Call(hdcMem, 0x00FFFFFF)
+		procDrawTextW.Call(hdcMem, uintptr(unsafe.Pointer(hint)), ^uintptr(0),
+			uintptr(unsafe.Pointer(&hintRc)), dtCenter|dtVcenter|dtSingleline)
+
+		procSelectObject.Call(hdcMem, origFont)
+		procDeleteObject.Call(hFont)
+		return
+	}
 
 	n := len(snapshot)
 	if n == 0 {
@@ -291,9 +495,8 @@ func paintGrid(hwnd uintptr) {
 		procDeleteObject.Call(hFont)
 	}()
 
-	// HALFTONE for quality downscaling
-	procSetStretchBltMode.Call(hdcMem, halftone)
-	procSetBrushOrgEx.Call(hdcMem, 0, 0, 0)
+	// COLORONCOLOR — reliable across drivers, no brush-origin requirement.
+	procSetStretchBltMode.Call(hdcMem, uintptr(colorOnColor))
 
 	const pad = int32(2)
 	for idx, cell := range snapshot {
@@ -308,23 +511,107 @@ func paintGrid(hwnd uintptr) {
 }
 
 func paintCell(hdc uintptr, x, y, w, h int32, cell *cellState) {
-	// Cell background
-	bgColor := uintptr(0x00181818)
+	// Layout: padded cell, image fits at top preserving aspect, name centered
+	// below the image. Cell background shows through any letterbox area, so
+	// no black bars — the user sees the WHOLE student desktop undistorted.
+	const (
+		cellPad = int32(10) // padding around image+label inside cell
+		nameH   = int32(22) // label strip below image
+		nameGap = int32(6)  // gap between image and label
+	)
+
+	// Cell background (also fills any letterbox area)
+	cellBg := uintptr(0x00181818)
 	if cell.offline {
-		bgColor = 0x001A0000
+		cellBg = 0x001A0000
 	}
-	bg, _, _ := procCreateSolidBrush.Call(bgColor)
+	bg, _, _ := procCreateSolidBrush.Call(cellBg)
 	cellRc := winRect{x, y, x + w, y + h}
 	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&cellRc)), bg)
 	procDeleteObject.Call(bg)
 
-	// Name bar background
-	nameBg, _, _ := procCreateSolidBrush.Call(0x00252525)
-	nameRc := winRect{x, y, x + w, y + nameBarH}
-	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&nameRc)), nameBg)
-	procDeleteObject.Call(nameBg)
+	// Image area: top portion of cell, padded; reserve space below for name.
+	imgArea := winRect{
+		x + cellPad,
+		y + cellPad,
+		x + w - cellPad,
+		y + h - cellPad - nameH - nameGap,
+	}
+	availW := imgArea.Right - imgArea.Left
+	availH := imgArea.Bottom - imgArea.Top
 
-	// Name text
+	if len(cell.pixels) > 0 && availW > 0 && availH > 0 {
+		// Aspect-preserving fit (letterbox inside imgArea). The bars are the
+		// cell background colour, not black — looks intentional, not broken.
+		scaleX := float64(availW) / float64(cell.imgW)
+		scaleY := float64(availH) / float64(cell.imgH)
+		scale := scaleX
+		if scaleY < scaleX {
+			scale = scaleY
+		}
+		dstW := int32(float64(cell.imgW) * scale)
+		dstH := int32(float64(cell.imgH) * scale)
+		if dstW < 1 {
+			dstW = 1
+		}
+		if dstH < 1 {
+			dstH = 1
+		}
+		dstX := imgArea.Left + (availW-dstW)/2
+		dstY := imgArea.Top + (availH-dstH)/2
+
+		// CPU-side nearest-neighbour resize to dst size, then 1:1 blit via
+		// SetDIBitsToDevice. SetDIBitsToDevice is documented for "DIB →
+		// device-dependent rectangle" with no scaling, and unlike
+		// StretchDIBits doesn't carry stretch-mode state — it doesn't hit
+		// the intermittent ret=0 bug observed during rapid window resize.
+		var (
+			drawW, drawH int32
+			drawPixels   []byte
+		)
+		if dstW == cell.imgW && dstH == cell.imgH {
+			drawW, drawH, drawPixels = cell.imgW, cell.imgH, cell.pixels
+		} else {
+			drawW, drawH = dstW, dstH
+			drawPixels = resizeBGRA(cell.pixels, cell.imgW, cell.imgH, dstW, dstH)
+		}
+
+		bi := bitmapInfoHeader{
+			biSize:     40,
+			biWidth:    drawW,
+			biHeight:   -drawH, // negative → top-down
+			biPlanes:   1,
+			biBitCount: 32,
+		}
+		ret, _, callErr := procSetDIBitsToDevice.Call(
+			hdc,
+			uintptr(dstX), uintptr(dstY),
+			uintptr(drawW), uintptr(drawH),
+			0, 0, // src x/y
+			0,                // StartScan
+			uintptr(drawH),   // cLines
+			uintptr(unsafe.Pointer(&drawPixels[0])),
+			uintptr(unsafe.Pointer(&bi)),
+			dibRgbColors,
+		)
+		if int32(ret) <= 0 {
+			devlog.Logf("SetDIBitsToDevice FAILED  ret=%d  err=%v  size=%dx%d",
+				int32(ret), callErr, drawW, drawH)
+		}
+	} else if availW > 0 && availH > 0 {
+		// No screenshot yet — show status text in the image area.
+		status := "Αναμονή..."
+		if cell.offline {
+			status = "Εκτός Σύνδεσης"
+		}
+		procSetBkMode.Call(hdc, uintptr(transparent))
+		procSetTextColor.Call(hdc, 0x00555555)
+		statusPtr := utf16(status)
+		procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(statusPtr)), ^uintptr(0),
+			uintptr(unsafe.Pointer(&imgArea)), dtCenter|dtVcenter|dtSingleline)
+	}
+
+	// Name label below the image (mockup-style: hostname under each cell).
 	procSetBkMode.Call(hdc, uintptr(transparent))
 	if cell.offline {
 		procSetTextColor.Call(hdc, 0x004444AA)
@@ -332,97 +619,222 @@ func paintCell(hdc uintptr, x, y, w, h int32, cell *cellState) {
 		procSetTextColor.Call(hdc, 0x00DDDDDD)
 	}
 	namePtr := utf16(cell.name)
-	nameTxtRc := winRect{x + 4, y + 4, x + w - 4, y + nameBarH - 2}
-	procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(namePtr)), ^uintptr(0),
-		uintptr(unsafe.Pointer(&nameTxtRc)), dtSingleline|dtLeft|dtVcenter)
-
-	imgArea := winRect{x, y + nameBarH, x + w, y + h}
-
-	if len(cell.pixels) > 0 {
-		bmi := bitmapInfo{
-			bmiHeader: bitmapInfoHeader{
-				biSize:     40,
-				biWidth:    cell.imgW,
-				biHeight:   -cell.imgH, // negative → top-down
-				biPlanes:   1,
-				biBitCount: 32,
-			},
-		}
-		procStretchDIBits.Call(
-			hdc,
-			uintptr(imgArea.Left), uintptr(imgArea.Top),
-			uintptr(imgArea.Right-imgArea.Left),
-			uintptr(imgArea.Bottom-imgArea.Top),
-			0, 0,
-			uintptr(cell.imgW), uintptr(cell.imgH),
-			uintptr(unsafe.Pointer(&cell.pixels[0])),
-			uintptr(unsafe.Pointer(&bmi)),
-			dibRgbColors,
-			srcCopy,
-		)
-	} else {
-		// No screenshot yet — show status text
-		status := "Αναμονή..."
-		if cell.offline {
-			status = "Εκτός Σύνδεσης"
-		}
-		procSetTextColor.Call(hdc, 0x00555555)
-		statusPtr := utf16(status)
-		procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(statusPtr)), ^uintptr(0),
-			uintptr(unsafe.Pointer(&imgArea)), dtCenter|dtVcenter|dtSingleline)
+	nameRc := winRect{
+		x + cellPad,
+		y + h - cellPad - nameH,
+		x + w - cellPad,
+		y + h - cellPad,
 	}
-
-	// Separator line (bottom + right edge of cell)
-	sepBrush, _, _ := procCreateSolidBrush.Call(0x00333333)
-	botLine := winRect{x, y + h, x + w, y + h + 1}
-	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&botLine)), sepBrush)
-	rightLine := winRect{x + w, y, x + w + 1, y + h}
-	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rightLine)), sepBrush)
-	procDeleteObject.Call(sepBrush)
+	procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(namePtr)), ^uintptr(0),
+		uintptr(unsafe.Pointer(&nameRc)), dtSingleline|dtCenter|dtVcenter)
 }
 
-// ── Pipe protocol helpers ─────────────────────────────────────────────────────
-
-type pipeReader struct{ handle uintptr }
-
-func (r *pipeReader) Read(buf []byte) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
+// resizeBGRA returns a new BGRA buffer of size dstW×dstH, sampled by nearest
+// neighbour from src. We do this on the CPU so the actual blit to the back
+// buffer is a 1:1 StretchDIBits — that path is reliable, while non-integer
+// downscales on memory DCs hit the documented intermittent-failure bug.
+//
+// Performance: at 1080p destination this is ~2 MB of writes per frame and
+// runs in well under a millisecond on any laptop the app would target.
+func resizeBGRA(src []byte, srcW, srcH, dstW, dstH int32) []byte {
+	dst := make([]byte, int(dstW)*int(dstH)*4)
+	if srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 {
+		return dst
 	}
-	var nRead uint32
-	ret, _, err := procReadFile.Call(
-		r.handle,
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(len(buf)),
-		uintptr(unsafe.Pointer(&nRead)),
+	srcStride := int(srcW) * 4
+	dstStride := int(dstW) * 4
+	// Pre-compute src x for each dst x to skip the multiply per pixel.
+	xMap := make([]int, dstW)
+	for x := int32(0); x < dstW; x++ {
+		sx := int(int64(x) * int64(srcW) / int64(dstW))
+		if sx >= int(srcW) {
+			sx = int(srcW) - 1
+		}
+		xMap[x] = sx * 4
+	}
+	for y := int32(0); y < dstH; y++ {
+		sy := int(int64(y) * int64(srcH) / int64(dstH))
+		if sy >= int(srcH) {
+			sy = int(srcH) - 1
+		}
+		srcRow := src[sy*srcStride:]
+		dstRow := dst[int(y)*dstStride:]
+		for x := int32(0); x < dstW; x++ {
+			off := xMap[x]
+			dstRow[int(x)*4+0] = srcRow[off+0]
+			dstRow[int(x)*4+1] = srcRow[off+1]
+			dstRow[int(x)*4+2] = srcRow[off+2]
+			dstRow[int(x)*4+3] = srcRow[off+3]
+		}
+	}
+	return dst
+}
+
+// ── Pipe protocol helpers (overlapped I/O) ────────────────────────────────────
+//
+// Why overlapped: synchronous ReadFile/WriteFile on a Win32 byte-mode named
+// pipe can wedge for minutes when the peer's I/O state machine drifts —
+// observed in production with 60+ second blocks on writes that should take
+// microseconds. With FILE_FLAG_OVERLAPPED we wait on an event with a real
+// timeout and CancelIoEx if the operation hangs.
+
+type pipeOp struct {
+	ov    syscall.Overlapped
+	event uintptr
+}
+
+func newPipeOp() (*pipeOp, error) {
+	h, _, e := procCreateEventW.Call(0, 1, 0, 0) // manual reset, nonsignaled
+	if h == 0 {
+		return nil, fmt.Errorf("CreateEvent: %w", e)
+	}
+	op := &pipeOp{event: h}
+	op.ov.HEvent = syscall.Handle(h)
+	return op, nil
+}
+
+func (op *pipeOp) close() {
+	if op == nil || op.event == 0 {
+		return
+	}
+	procCloseHandle.Call(op.event)
+	op.event = 0
+}
+
+func (op *pipeOp) reset() {
+	op.ov = syscall.Overlapped{HEvent: syscall.Handle(op.event)}
+	procResetEvent.Call(op.event)
+}
+
+// pipeWriteAll writes the full buffer with a per-call timeout. CancelIoEx on
+// timeout so the kernel doesn't keep the I/O queued against the OVERLAPPED.
+func pipeWriteAll(handle uintptr, op *pipeOp, data []byte, timeout time.Duration) error {
+	if len(data) == 0 {
+		return nil
+	}
+	op.reset()
+	var written uint32
+	ret, _, e := procWriteFile.Call(
+		handle,
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)),
+		uintptr(unsafe.Pointer(&written)),
+		uintptr(unsafe.Pointer(&op.ov)),
+	)
+	if ret != 0 {
+		if int(written) != len(data) {
+			return fmt.Errorf("WriteFile partial: %d/%d", written, len(data))
+		}
+		return nil
+	}
+	if e != syscall.Errno(errorIoPending) {
+		return fmt.Errorf("WriteFile: %w", e)
+	}
+	waitMs := uint32(timeout / time.Millisecond)
+	if waitMs == 0 {
+		waitMs = 1
+	}
+	wRet, _, _ := procWaitForSingleObject.Call(op.event, uintptr(waitMs))
+	if wRet == waitTimeout {
+		procCancelIoEx.Call(handle, uintptr(unsafe.Pointer(&op.ov)))
+		procWaitForSingleObject.Call(op.event, infinite)
+		return fmt.Errorf("WriteFile timeout after %v", timeout)
+	}
+	if wRet != waitObject0 {
+		return fmt.Errorf("WriteFile WaitForSingleObject: 0x%x", wRet)
+	}
+	var transferred uint32
+	gRet, _, gErr := procGetOverlappedResult.Call(
+		handle,
+		uintptr(unsafe.Pointer(&op.ov)),
+		uintptr(unsafe.Pointer(&transferred)),
 		0,
 	)
-	if ret == 0 {
-		return 0, fmt.Errorf("ReadFile: %w", err)
+	if gRet == 0 {
+		return fmt.Errorf("GetOverlappedResult: %w", gErr)
 	}
-	if nRead == 0 {
-		return 0, io.EOF
+	if int(transferred) != len(data) {
+		return fmt.Errorf("WriteFile partial: %d/%d", transferred, len(data))
 	}
-	return int(nRead), nil
+	return nil
 }
 
-// connectPipe retries CreateFile on the pipe for up to 15 seconds.
+// pipeReadFull reads exactly len(buf) bytes with an overall timeout, looping
+// over partial reads. The timeout starts fresh from the time of the call.
+func pipeReadFull(handle uintptr, op *pipeOp, buf []byte, timeout time.Duration) error {
+	if len(buf) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	read := 0
+	for read < len(buf) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("ReadFile timeout")
+		}
+		op.reset()
+		var nRead uint32
+		ret, _, e := procReadFile.Call(
+			handle,
+			uintptr(unsafe.Pointer(&buf[read])),
+			uintptr(len(buf)-read),
+			uintptr(unsafe.Pointer(&nRead)),
+			uintptr(unsafe.Pointer(&op.ov)),
+		)
+		if ret == 0 && e != syscall.Errno(errorIoPending) {
+			return fmt.Errorf("ReadFile: %w", e)
+		}
+		if ret == 0 {
+			waitMs := uint32(remaining / time.Millisecond)
+			if waitMs == 0 {
+				waitMs = 1
+			}
+			wRet, _, _ := procWaitForSingleObject.Call(op.event, uintptr(waitMs))
+			if wRet == waitTimeout {
+				procCancelIoEx.Call(handle, uintptr(unsafe.Pointer(&op.ov)))
+				procWaitForSingleObject.Call(op.event, infinite)
+				return fmt.Errorf("ReadFile timeout")
+			}
+			if wRet != waitObject0 {
+				return fmt.Errorf("ReadFile WaitForSingleObject: 0x%x", wRet)
+			}
+			var transferred uint32
+			gRet, _, gErr := procGetOverlappedResult.Call(
+				handle,
+				uintptr(unsafe.Pointer(&op.ov)),
+				uintptr(unsafe.Pointer(&transferred)),
+				0,
+			)
+			if gRet == 0 {
+				return fmt.Errorf("GetOverlappedResult (read): %w", gErr)
+			}
+			nRead = transferred
+		}
+		if nRead == 0 {
+			return io.EOF
+		}
+		read += int(nRead)
+	}
+	return nil
+}
+
+// connectPipe retries CreateFile on the pipe for up to 15 seconds. Opens the
+// handle with FILE_FLAG_OVERLAPPED so all subsequent I/O is async-capable.
 func connectPipe() (uintptr, error) {
 	namePtr, _ := syscall.UTF16PtrFromString(`\\.\pipe\ClassSendMonitor`)
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		h, _, _ := procCreateFileW.Call(
 			uintptr(unsafe.Pointer(namePtr)),
-			genericRead,
+			uintptr(genericRead|genericWrite),
 			0, 0,
 			openExisting,
-			fileAttrNormal,
+			fileAttrNormal|fileFlagOverlapped,
 			0,
 		)
 		if h != invalidHandle {
 			return h, nil
 		}
-		// Wait up to 1 s for the pipe to become available
 		procWaitNamedPipe.Call(uintptr(unsafe.Pointer(namePtr)), 1000)
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -432,21 +844,38 @@ func connectPipe() (uintptr, error) {
 // readPipe reads messages from the pipe and updates the grid state.
 // Runs in its own goroutine; posts wmUpdate or wmPipeEOF to hwnd.
 func readPipe(handle, hwnd uintptr) {
-	r := &pipeReader{handle: handle}
+	defer func() {
+		if r := recover(); r != nil {
+			devlog.Logf("readPipe PANIC: %v\n%s", r, debug.Stack())
+		}
+	}()
+	op, err := newPipeOp()
+	if err != nil {
+		devlog.Logf("readPipe: newPipeOp: %v", err)
+		procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
+		return
+	}
+	defer op.close()
 	hdr := make([]byte, 8)
 
 	for {
-		if _, err := io.ReadFull(r, hdr); err != nil {
+		// Long timeout per header read so we wake periodically; the goroutine
+		// is happy to sit idle for a minute between teacher messages.
+		if err := pipeReadFull(handle, op, hdr, time.Minute); err != nil {
+			devlog.Logf("readPipe: header read err: %v", err)
 			procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
 			return
 		}
 		msgType := binary.LittleEndian.Uint32(hdr[0:4])
 		payLen := binary.LittleEndian.Uint32(hdr[4:8])
+		devlog.Logf("readPipe: msgType=%d payLen=%d", msgType, payLen)
 
 		var payload []byte
 		if payLen > 0 {
 			payload = make([]byte, payLen)
-			if _, err := io.ReadFull(r, payload); err != nil {
+			// Once a header arrives, the body should follow within 10 s.
+			if err := pipeReadFull(handle, op, payload, 10*time.Second); err != nil {
+				devlog.Logf("readPipe: payload read err: %v", err)
 				procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
 				return
 			}
@@ -455,13 +884,19 @@ func readPipe(handle, hwnd uintptr) {
 		switch msgType {
 		case msgInit:
 			handleInit(payload)
+			devlog.Logf("readPipe: handleInit done")
 		case msgShot:
 			handleShot(payload)
+			devlog.Logf("readPipe: handleShot done")
 		case msgOffline:
 			handleOffline(payload)
+			devlog.Logf("readPipe: handleOffline done")
 		case msgStop:
+			devlog.Logf("readPipe: msgStop received")
 			procPostMessageW.Call(hwnd, wmClose, 0, 0)
 			return
+		default:
+			devlog.Logf("readPipe: UNKNOWN msgType=%d", msgType)
 		}
 
 		procPostMessageW.Call(hwnd, wmUpdate, 0, 0)
@@ -503,12 +938,19 @@ func handleInit(payload []byte) {
 }
 
 func handleShot(payload []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			devlog.Logf("handleShot PANIC: %v\n%s", r, debug.Stack())
+		}
+	}()
 	if len(payload) < 8 {
+		devlog.Logf("handleShot: payload too short  len=%d", len(payload))
 		return
 	}
 	idx := binary.LittleEndian.Uint32(payload[0:4])
 	jpegLen := int(binary.LittleEndian.Uint32(payload[4:8]))
 	if 8+jpegLen > len(payload) {
+		devlog.Logf("handleShot: truncated  jpegLen=%d payload=%d", jpegLen, len(payload))
 		return
 	}
 	jpegData := payload[8 : 8+jpegLen]
@@ -516,6 +958,7 @@ func handleShot(payload []byte) {
 	// Decode JPEG → RGBA → BGRA (Windows DIB)
 	img, err := jpeg.Decode(bytes.NewReader(jpegData))
 	if err != nil {
+		devlog.Logf("handleShot: jpeg.Decode err: %v", err)
 		return
 	}
 	bounds := img.Bounds()
@@ -542,6 +985,8 @@ func handleShot(payload []byte) {
 		cells[idx].imgW = int32(imgW)
 		cells[idx].imgH = int32(imgH)
 		cells[idx].offline = false
+		devlog.Logf("shot received  idx=%d  %dx%d  jpeg=%dB  bgra=%dB",
+			idx, imgW, imgH, jpegLen, len(bgra))
 	}
 }
 
@@ -571,14 +1016,23 @@ func i32(n int32) uintptr { return uintptr(uint32(n)) }
 func main() {
 	runtime.LockOSThread()
 
+	devlog.Init("monitoring")
+	defer devlog.Close()
+	devlog.Logf("startup  pid=%d  build=%s  exe=%s", os.Getpid(), buildinfo.String(), os.Args[0])
+
 	hInst, _, _ := procGetModuleHandleW.Call(0)
 	className := utf16("ClassSendMonitor")
 
+	// IDC_ARROW = 32512. Without an hCursor set, Windows shows the wait/busy
+	// cursor permanently because the system has no default to draw.
+	arrowCursor, _, _ := procLoadCursorW.Call(0, uintptr(32512))
+
 	wc := wndClassExW{
 		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
-		style:         csHredraw | csVredraw,
+		style:         0,
 		lpfnWndProc:   wndProcCallback,
 		hInstance:     hInst,
+		hCursor:       arrowCursor,
 		hbrBackground: 0, // painted in WM_PAINT
 		lpszClassName: className,
 	}
@@ -597,7 +1051,7 @@ func main() {
 	hwnd, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(utf16("ClassSend - Παρακολούθηση Τάξης"))),
+		uintptr(unsafe.Pointer(utf16("ClassSend - Παρακολούθηση Τάξης  ["+buildinfo.String()+"]"))),
 		wsOverlappedWindow|wsVisible,
 		winX, winY, winW, winH,
 		0, 0, hInst, 0,
@@ -611,12 +1065,26 @@ func main() {
 
 	// Connect to the classsend pipe in the background
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				devlog.Logf("pipe goroutine PANIC: %v\n%s", r, debug.Stack())
+			}
+		}()
 		pipe, err := connectPipe()
 		if err != nil {
+			devlog.Logf("pipe connect FAILED: %v", err)
 			procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
 			return
 		}
+		pipeMu.Lock()
+		pipeHandle = pipe
+		pipeMu.Unlock()
+		devlog.Logf("pipe connected, entering read loop")
 		readPipe(pipe, hwnd)
+		devlog.Logf("read loop exited, closing pipe")
+		pipeMu.Lock()
+		pipeHandle = 0
+		pipeMu.Unlock()
 		procCloseHandle.Call(pipe)
 	}()
 

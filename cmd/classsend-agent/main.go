@@ -7,13 +7,16 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"classsend/internal/buildinfo"
 	"classsend/internal/core"
+	"classsend/internal/devlog"
 	"classsend/internal/ipc"
 	"classsend/internal/protocol"
 )
@@ -34,7 +37,18 @@ func sendToTUI(f ipc.Frame) {
 
 func main() {
 	dev := flag.Bool("dev", false, "Dev mode: skip autostart, scan localhost")
+	showVer := flag.Bool("version", false, "Print version and exit")
+	showVerShort := flag.Bool("ver", false, "Print version and exit (alias)")
 	flag.Parse()
+
+	if *showVer || *showVerShort {
+		fmt.Println("ClassSend 2 Agent  " + buildinfo.String())
+		os.Exit(0)
+	}
+
+	devlog.Init("agent")
+	defer devlog.Close()
+	devlog.Logf("startup  dev=%v  build=%s  exe=%s", *dev, buildinfo.String(), os.Args[0])
 
 	hideConsole() // Windows: hide the console window so the agent is invisible
 
@@ -58,9 +72,11 @@ func main() {
 
 	// Forward connection state changes to any connected TUI
 	app.OnConnected = func() {
+		devlog.Logf("connected to teacher")
 		sendToTUI(ipc.Frame{Type: ipc.TypeConnected})
 	}
 	app.OnDisconnected = func() {
+		devlog.Logf("disconnected from teacher")
 		sendToTUI(ipc.Frame{Type: ipc.TypeDisconnected})
 	}
 
