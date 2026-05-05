@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"fmt"
 	"image"
-	"image/draw"
 	"image/jpeg"
 	"os"
 	"os/exec"
@@ -19,7 +18,6 @@ import (
 
 	"classsend/internal/core"
 	"classsend/internal/devlog"
-	"classsend/internal/network"
 	"classsend/internal/protocol"
 )
 
@@ -241,17 +239,15 @@ type bitmapInfoHeader struct {
 // ── Callback allocation ───────────────────────────────────────────────────────
 
 var (
-	wndProcCB    uintptr
-	keyHookCB    uintptr
-	notifProcCB  uintptr
-	castViewProcCB uintptr
+	wndProcCB   uintptr
+	keyHookCB   uintptr
+	notifProcCB uintptr
 )
 
 func init() {
-	wndProcCB      = syscall.NewCallback(overlayWndProc)
-	keyHookCB      = syscall.NewCallback(keyboardHookProc)
-	notifProcCB    = syscall.NewCallback(monitorNotifWndProc)
-	castViewProcCB = syscall.NewCallback(castViewWndProc)
+	wndProcCB   = syscall.NewCallback(overlayWndProc)
+	keyHookCB   = syscall.NewCallback(keyboardHookProc)
+	notifProcCB = syscall.NewCallback(monitorNotifWndProc)
 }
 
 // ── Screen capture ────────────────────────────────────────────────────────────
@@ -787,304 +783,112 @@ func hideMonitoringNotification() {
 	}
 }
 
+
 // ── Casting viewer ────────────────────────────────────────────────────────────
 //
-// The student's casting viewer is a fullscreen Win32 window that displays JPEG
-// frames streamed from the teacher over a dedicated TCP connection (CastServer).
-// Frames are decoded on the receiving goroutine; a WM_APP+1 message triggers
-// a repaint.  Students cannot close the window — only a CmdStopCast from the
-// teacher does.
-
-const (
-	wmCastNewFrame = 0x8001 // WM_APP+1: new frame decoded, trigger repaint
-	wmCastClose    = 0x8002 // WM_APP+2: teacher stopped casting, destroy window
-)
+// The student-side cast viewer used to be a hand-rolled Win32 GDI window
+// living inside this process (~250 lines of wndproc + drawCastFrame +
+// runCastViewWindow). v0.0.4-b moves it out to a separate castviewer.exe
+// (WebView2-based, see cmd/castviewer). The agent just spawns and kills it.
+//
+// Lifecycle:
+//   - CmdStartCast(addr): spawn castviewer.exe -addr <addr>. If a viewer is
+//     already running for an old cast, it is killed and replaced.
+//   - CmdStopCast: kill the viewer process.
+//   - TypeShowCast IPC (--cast in the student TUI): respawn using the last
+//     known address. If no cast is currently active, this is a no-op.
 
 var (
-	castViewMu      sync.Mutex
-	castViewHwnd    uintptr
-	castViewTopmost bool
-
-	castClientMu  sync.Mutex
-	castClientConn *network.CastClient // active cast connection, nil when idle
-
-	castFrameMu  sync.RWMutex
-	castFramePix []byte // latest decoded frame as BGRA pixels
-	castFrameW   int
-	castFrameH   int
+	castMu       sync.Mutex
+	castProc     *exec.Cmd
+	lastCastAddr string
 )
 
-func castViewWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
-	switch msg {
-	case wmCastNewFrame:
-		procInvalidateRect.Call(hwnd, 0, 0)
-		return 0
-	case wmSize:
-		procInvalidateRect.Call(hwnd, 0, 0)
-		return 0
-	case wmCastClose:
-		// Teacher stopped cast — hide the window (keep alive for reuse)
-		procShowWindow.Call(hwnd, swHide)
-		return 0
-	case wmClose:
-		// User clicked the X button — hide instead of destroying
-		procShowWindow.Call(hwnd, swHide)
-		return 0
-	case wmKeydown:
-		switch wParam {
-		case vkCharT: // toggle stay-on-top
-			castViewMu.Lock()
-			nowTop := !castViewTopmost
-			castViewTopmost = nowTop
-			castViewMu.Unlock()
-			zorder := uintptr(hwndNotopmost)
-			if nowTop {
-				zorder = hwndTopmost
-			}
-			procSetWindowPos.Call(hwnd, zorder, 0, 0, 0, 0, swpNomove|swpNosize)
-			return 0
-		case vkCharF: // toggle maximize / restore
-			zoomed, _, _ := procIsZoomed.Call(hwnd)
-			if zoomed != 0 {
-				procShowWindow.Call(hwnd, swRestore)
-			} else {
-				procShowWindow.Call(hwnd, swMaximize)
-			}
-			return 0
-		}
-	case wmPaint:
-		drawCastFrame(hwnd)
-		return 0
-	case wmErasebkgnd:
-		return 1
-	case wmDestroy:
-		castViewMu.Lock()
-		castViewHwnd = 0
-		castViewMu.Unlock()
-		procPostQuitMessage.Call(0)
-		return 0
-	}
-	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wParam, lParam)
-	return r
-}
-
-func drawCastFrame(hwnd uintptr) {
-	castFrameMu.RLock()
-	pix := castFramePix
-	fw, fh := castFrameW, castFrameH
-	castFrameMu.RUnlock()
-
-	var ps paintStruct
-	hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-
-	var rc winRect
-	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
-	winW, winH := rc.Right, rc.Bottom
-
-	// Back-buffer at window size — we draw everything here, then BitBlt
-	// to the screen DC in one atomic call, eliminating the black flash.
-	hdcBack, _, _ := procCreateCompatibleDC.Call(hdc)
-	hBmpBack, _, _ := procCreateCompatibleBitmap.Call(hdc, uintptr(winW), uintptr(winH))
-	oldBack, _, _ := procSelectObject.Call(hdcBack, hBmpBack)
-
-	// Black background
-	bg, _, _ := procCreateSolidBrush.Call(0)
-	procFillRect.Call(hdcBack, uintptr(unsafe.Pointer(&rc)), bg)
-	procDeleteObject.Call(bg)
-
-	if len(pix) > 0 && fw > 0 && fh > 0 {
-		// Letterbox: scale to fit while preserving aspect ratio
-		scaleX := float64(winW) / float64(fw)
-		scaleY := float64(winH) / float64(fh)
-		scale := scaleX
-		if scaleY < scaleX {
-			scale = scaleY
-		}
-		dstW := int32(float64(fw) * scale)
-		dstH := int32(float64(fh) * scale)
-		dstX := (winW - dstW) / 2
-		dstY := (winH - dstH) / 2
-
-		// StretchDIBits goes straight from the DIB pixel buffer into the back-
-		// buffer DC. Avoids the SetDIBits-on-selected-bitmap pitfall that was
-		// blanking every frame after the first.
-		bi := bitmapInfoHeader{
-			biSize:        40,
-			biWidth:       int32(fw),
-			biHeight:      -int32(fh), // top-down DIB
-			biPlanes:      1,
-			biBitCount:    32,
-			biCompression: biRgb,
-		}
-		procSetStretchBltMode.Call(hdcBack, uintptr(colorOnColor))
-		ret, _, callErr := procStretchDIBits.Call(
-			hdcBack,
-			uintptr(dstX), uintptr(dstY), uintptr(dstW), uintptr(dstH),
-			0, 0, uintptr(fw), uintptr(fh),
-			uintptr(unsafe.Pointer(&pix[0])),
-			uintptr(unsafe.Pointer(&bi)),
-			dibRgbColors,
-			srcCopy,
-		)
-		devlog.Logf("cast paint  src=%dx%d  dst=%dx%d  win=%dx%d  ret=%d  err=%v",
-			fw, fh, dstW, dstH, winW, winH, int32(ret), callErr)
-	} else {
-		devlog.Logf("cast paint SKIPPED  pix=%d  fw=%d  fh=%d", len(pix), fw, fh)
-	}
-
-	// Atomic transfer to screen
-	procBitBlt.Call(hdc, 0, 0, uintptr(winW), uintptr(winH), hdcBack, 0, 0, srcCopy)
-	procSelectObject.Call(hdcBack, oldBack)
-	procDeleteObject.Call(hBmpBack)
-	procDeleteDC.Call(hdcBack)
-}
-
-// updateCastFrame decodes a JPEG frame and signals the Win32 window to repaint.
-// Called from the CastClient receive goroutine.
-func updateCastFrame(jpegData []byte) {
-	src, err := jpeg.Decode(bytes.NewReader(jpegData))
-	if err != nil {
-		return
-	}
-	b := src.Bounds()
-	w, h := b.Dx(), b.Dy()
-	nrgba := image.NewNRGBA(image.Rect(0, 0, w, h))
-	draw.Draw(nrgba, nrgba.Bounds(), src, b.Min, draw.Src)
-
-	// RGBA → BGRA for Windows DIBs
-	pix := make([]byte, w*h*4)
-	for i := 0; i < len(nrgba.Pix); i += 4 {
-		pix[i+0] = nrgba.Pix[i+2]
-		pix[i+1] = nrgba.Pix[i+1]
-		pix[i+2] = nrgba.Pix[i+0]
-		pix[i+3] = 255
-	}
-
-	castFrameMu.Lock()
-	castFramePix = pix
-	castFrameW = w
-	castFrameH = h
-	castFrameMu.Unlock()
-
-	castViewMu.Lock()
-	hwnd := castViewHwnd
-	castViewMu.Unlock()
-	devlog.Logf("cast frame  %dx%d  jpeg=%dB  bgra=%dB  hwnd=%v",
-		w, h, len(jpegData), len(pix), hwnd != 0)
-	if hwnd != 0 {
-		procPostMessageW.Call(hwnd, wmCastNewFrame, 0, 0)
-	}
-}
-
 func showCastingViewer() {
-	castViewMu.Lock()
-	if castViewHwnd != 0 {
-		hwnd := castViewHwnd
-		castViewMu.Unlock()
-		procShowWindow.Call(hwnd, swShow)
-		procSetForegroundWindow.Call(hwnd)
+	// Re-spawn at the last known address if available — used by the student
+	// TUI's --cast command. With no prior address this is a no-op.
+	castMu.Lock()
+	addr := lastCastAddr
+	castMu.Unlock()
+	if addr == "" {
+		devlog.Logf("showCastingViewer: no prior addr, ignoring")
 		return
 	}
-	ready := make(chan uintptr, 1)
-	go runCastViewWindow(ready)
-	castViewHwnd = <-ready
-	castViewMu.Unlock()
+	startCastViewer(addr)
 }
 
 func hideCastingViewer() {
-	// Disconnect TCP stream
-	castClientMu.Lock()
-	if castClientConn != nil {
-		castClientConn.Close()
-		castClientConn = nil
-	}
-	castClientMu.Unlock()
-
-	// Hide the Win32 window (post wmCastClose so the UI thread handles it)
-	castViewMu.Lock()
-	hwnd := castViewHwnd
-	castViewMu.Unlock()
-	if hwnd != 0 {
-		procPostMessageW.Call(hwnd, wmCastClose, 0, 0)
+	castMu.Lock()
+	p := castProc
+	castProc = nil
+	castMu.Unlock()
+	if p != nil && p.Process != nil {
+		_ = p.Process.Kill()
+		devlog.Logf("hideCastingViewer: killed pid=%d", p.Process.Pid)
 	}
 }
 
-// connectCastStream dials the teacher's dedicated cast server and streams frames
-// into updateCastFrame until the connection closes or hideCastingViewer is called.
-func connectCastStream(serverAddr string) {
-	client, err := network.DialCast(serverAddr)
-	if err != nil {
+// startCastViewer launches castviewer.exe pointing at the given teacher
+// address. If a previous viewer is still around (from an earlier cast or a
+// stale process) it is killed first so the student never sees two windows.
+func startCastViewer(addr string) {
+	castMu.Lock()
+	if castProc != nil && castProc.Process != nil {
+		_ = castProc.Process.Kill()
+	}
+	lastCastAddr = addr
+	castMu.Unlock()
+
+	exePath := findCastViewerExe()
+	if exePath == "" {
+		devlog.Logf("startCastViewer: castviewer.exe not found")
 		return
 	}
-
-	castClientMu.Lock()
-	if castClientConn != nil {
-		castClientConn.Close()
+	cmd := exec.Command(exePath, "-addr", addr)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    false,
+		CreationFlags: 0x00000008, // DETACHED_PROCESS
 	}
-	castClientConn = client
-	castClientMu.Unlock()
-
-	client.OnFrame = func(data []byte) {
-		updateCastFrame(data)
+	if err := cmd.Start(); err != nil {
+		devlog.Logf("startCastViewer: spawn failed: %v", err)
+		return
 	}
-	client.Run() // blocks until connection closed
+	devlog.Logf("startCastViewer: spawned %s pid=%d addr=%s", exePath, cmd.Process.Pid, addr)
+	castMu.Lock()
+	castProc = cmd
+	castMu.Unlock()
 
-	castClientMu.Lock()
-	if castClientConn == client {
-		castClientConn = nil
-	}
-	castClientMu.Unlock()
+	// Reap the process so a viewer that exits on its own (TCP closed,
+	// student clicked X) doesn't become a zombie. Clear castProc so the
+	// next StopCast doesn't try to kill an already-dead PID.
+	go func(c *exec.Cmd) {
+		_ = c.Wait()
+		castMu.Lock()
+		if castProc == c {
+			castProc = nil
+		}
+		castMu.Unlock()
+		devlog.Logf("castviewer pid=%d exited", c.Process.Pid)
+	}(cmd)
 }
 
-func runCastViewWindow(hwndOut chan<- uintptr) {
-	runtime.LockOSThread()
-
-	hInst, _, _ := procGetModuleHandleW.Call(0)
-	className := utf16("ClassSendCastView")
-
-	// IDC_ARROW = 32512. Without an hCursor set, Windows shows the wait
-	// cursor permanently because no default exists.
-	arrowCursor, _, _ := procLoadCursorW.Call(0, uintptr(32512))
-
-	wc := wndClassExW{
-		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
-		style:         0,
-		lpfnWndProc:   castViewProcCB,
-		hInstance:     hInst,
-		hCursor:       arrowCursor,
-		hbrBackground: 0,
-		lpszClassName: className,
-	}
-	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
-
-	// Centered 960×600 resizable window
-	sw, _, _ := procGetSystemMetrics.Call(smCxScreen)
-	sh, _, _ := procGetSystemMetrics.Call(smCyScreen)
-	const winW, winH = 960, 600
-	winX := (int(sw) - winW) / 2
-	winY := (int(sh) - winH) / 2
-
-	hwnd, _, _ := procCreateWindowExW.Call(
-		0,
-		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(utf16("Οθόνη Δασκάλου — ClassSend  [F: πλήρης οθόνη | T: πάντα πάνω]"))),
-		wsOverlappedWindow|wsVisible,
-		uintptr(winX), uintptr(winY), winW, winH,
-		0, 0, hInst, 0,
-	)
-
-	hwndOut <- hwnd
-
-	var m winMsg
-	for {
-		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
-		if r == 0 || r == ^uintptr(0) {
-			break
+// findCastViewerExe looks for castviewer.exe next to the running agent
+// (production install layout) and falls back to the cwd (dev layout).
+func findCastViewerExe() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := exe[:strings.LastIndexAny(exe, `/\`)]
+		candidate := dir + `\castviewer.exe`
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
 		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
+	if _, err := os.Stat("castviewer.exe"); err == nil {
+		return "castviewer.exe"
+	}
+	return ""
 }
 
 // ── Console visibility ────────────────────────────────────────────────────────
@@ -1384,9 +1188,10 @@ func setupStudentCommands(app *core.App, devMode bool) {
 			stopMonitoring()
 
 		case protocol.CmdStartCast:
-			showCastingViewer()
 			if cmd.Param != "" {
-				go connectCastStream(cmd.Param)
+				startCastViewer(cmd.Param)
+			} else {
+				devlog.Logf("CmdStartCast: empty param, ignoring")
 			}
 
 		case protocol.CmdStopCast:

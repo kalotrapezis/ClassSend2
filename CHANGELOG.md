@@ -13,6 +13,85 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 - Persistent teacher daemon (session survives TUI close)
 - System tray icon for student agent
 - Subnet scan with 30-day network history prioritization
+- Restore custom icon for 32-bit builds (generate `resource_386.syso` via `rsrc` or `goversioninfo`)
+- Win7 chat TUI — would require downgrading bubbletea/lipgloss to v0.25-era and rewriting `internal/tui/model.go` against the older API, or splitting the TUI into its own go.work module
+
+---
+
+## [0.0.4-b] — 2026-05-05
+
+Cast viewer rewritten on WebView2 to match the monitoring rewrite from 0.0.4-a. Same architectural reasoning: stop fighting GDI's `StretchDIBits` quirks, hand the pixel pipeline to a real browser engine.
+
+### Changed
+
+#### Cast viewer rewritten on WebView2
+- **New `castviewer.exe`** ([cmd/castviewer/](cmd/castviewer/)) — standalone WebView2 process. Takes `-addr host:port`, dials the teacher's `CastServer` directly, base64-encodes each JPEG frame and pushes it to the page via `Eval("applyFrame('...')")`. CSS `object-fit: contain` handles letterbox; `<img src=>` swap is flicker-free.
+- **Agent now spawns instead of renders.** [cmd/classsend-agent/syscommands_windows.go](cmd/classsend-agent/syscommands_windows.go) lost ~250 lines of Win32 cast code (wndproc, `drawCastFrame`, `runCastViewWindow`, `updateCastFrame`, `castFramePix`/`castFrameW`/`castFrameH` state). `CmdStartCast` now `exec.Command("castviewer.exe", "-addr", ...)`; `CmdStopCast` `Process.Kill`s it. A reaper goroutine clears `castProc` if the viewer exits on its own (TCP closed, X clicked) so the next `StopCast` doesn't try to kill a dead PID.
+- **The TCP wire format and `CastServer` are unchanged.** `internal/network/cast.go` and `internal/core/state.go` did not move. An old agent talking to a new teacher (or the reverse) still works for everything except the viewer's UI tech.
+- Imports `image/draw` and `classsend/internal/network` removed from the agent (no longer needed). `vkCharF`/`vkCharT` constants and the `castViewProcCB` callback also gone.
+
+### Added
+
+- **`cmd/casttest/`** — drives the cast pipeline end-to-end without a teacher or students. Spins up the project's real `network.NewCastServer`, generates synthetic JPEG frames at a configurable rate, spawns N `castviewer.exe` processes, and watches for early viewer crashes. Verified clean: **3 viewers, 20 fps, 15-second run, 0 dropped frames across 1200 deliveries.**
+- **`castviewer.exe` shipped by the installer** for `UseModern64` and `UseModern32` student installs (and Dev). Win7 students don't get a castviewer — WebView2 isn't supported there. The agent's `findCastViewerExe` returns empty on Win7, so `CmdStartCast` is logged and ignored gracefully.
+
+### Build / repo
+
+- `build.bat` now builds `castviewer.exe` (modern x64) and `dist\castviewer-win10-x86.exe` (modern x86).
+
+### Known limitations
+
+- Cast viewer requires WebView2 runtime on the **student** PC, not just the teacher. Win7 students cannot run a cast viewer; they still receive every other teacher command.
+- `network.CastClient` / `network.DialCast` in [internal/network/cast.go](internal/network/cast.go) are now unreferenced public API — kept for any future caller that wants the wire format helpers, but no production code uses them.
+
+---
+
+## [0.0.4-a] — 2026-05-04
+
+First release of the 0.0.4 line. Two themes: monitoring is rewritten on top of WebView2, and the install matrix grows from two tiers to three.
+
+### Changed
+
+#### Monitoring rewritten on WebView2
+- **`monitoring.exe` is now a thin WebView2 host.** The previous ~1100-line hand-rolled Win32 GDI grid (cached back-buffers, CPU-side BGRA resize, intermittent `StretchDIBits` retries) is gone. `cmd/monitoring/main.go` is now ~500 lines, half of which is the embedded HTML/CSS/JS page. Layout is CSS Grid with `aspect-ratio: 16/9` cells; image elements are reused so each shot is a single `<img src=>` swap that the browser decodes flicker-free.
+- **The teacher↔monitoring named-pipe protocol (`MsgInit` / `MsgShot` / `MsgOffline` / `MsgStop` / `MsgFocus`) is byte-for-byte identical** to 0.0.3. `teacher.exe` and `internal/monitoring/session_windows.go` did not change. An old `teacher.exe` will still drive the new `monitoring.exe` and vice versa.
+- **Click-to-focus and Esc-to-exit** still work; the click round-trip goes JS → `Bind("onCellClick")` → `MsgFocus` on the same back-channel pipe.
+- **Runtime requirement:** Microsoft Edge WebView2. Ships with Windows 11; auto-installed via Edge on Windows 10. Teacher-side only — student PCs are unaffected.
+- Adds dependency `github.com/jchv/go-webview2`.
+
+#### Three-tier install matrix
+The installer now picks one of three binary tiers based on the detected OS at install time:
+
+| System | Student TUI | Agent | Toolchain |
+|---|---|---|---|
+| Win10/11 x64 | `student.exe` (64-bit) | `classsend-agent.exe` (64-bit) | Go 1.24 |
+| Win10/11 x86 *(new)* | `student-win10-x86.exe` (32-bit, full TUI) | `classsend-agent-win10-x86.exe` | Go 1.24 |
+| Win7 / Win8 any | *(none — agent only)* | `classsend-agent-win7-x86.exe` | Go 1.20 |
+
+The `[Code]` block in `setup/classsend2.iss` exposes three predicates — `UseModern64`, `UseModern32`, `UseLegacy32` — and each `[Files]` / `[Icons]` / `[Run]` entry is gated on the right one. Win7 PCs no longer get a broken desktop shortcut to a non-running `classsend.exe`.
+
+### Fixed
+
+- **Student list jitter in the monitoring grid.** `Server.Students()` ([`internal/network/server.go`](internal/network/server.go)) returned students in Go map-iteration order — randomised on every call. The monitoring poll loop's `studentsChanged` compares by index, so it considered the list changed every single tick, re-sent `MsgInit` every tick, and the grid re-shuffled forever even when nobody joined or left. Now sorted by ID.
+- **Per-cell screenshot loss on roster changes.** Old `monitoring.exe` preserved a cell's screenshot only when the slot index *and* the name both matched on `MsgInit`. With a real reorder, only one slot would survive. The new `applyInit` in the WebView builds a `name → cell` map first and copies the previous `<img src>` across by name, so a join/leave/rename only affects the changed students.
+- **No more black flash on transient comm failures.** A new shot is now applied via `<img src=>`; the browser keeps the previous frame visible until the new JPEG decodes. `applyOffline` tints the cell red but **keeps the last good screenshot** rather than clearing it — no more "show a black box because we missed one poll".
+
+### Added
+
+- **`cmd/fakeagent/`** — synthetic student. Connects directly to the teacher's `:47820`, completes the handshake, replies to `CmdRequestShot` with a generated JPEG (gradient + name + frame counter). Each instance gets its own hue. Use multiple in parallel for full-stack monitoring tests without four real PCs.
+- **`cmd/monitortest/`** — drives `monitoring.exe` directly through its named pipe. Spawns the binary, sends `MsgInit` with three fake students, streams shots, **reorders the list every 10 s** (regression test for the slot-vs-name preservation), and **marks one cell offline every 15 s**. Verified clean (zero panics, zero pipe errors) on the v0.0.4-a build.
+- **`build-win7.bat`** — produces `dist\classsend-agent-win7-x86.exe` using Go 1.20.14 at `C:\Go120` with `GOOS=windows GOARCH=386`. Backs up `go.mod`, downgrades the `go 1.24.2` directive in-place (Go 1.20's parser rejects three-component versions), builds, then restores. Always restores on exit even if the build fails.
+- **`build.bat`** now also produces the Win10 x86 pair (`dist\student-win10-x86.exe`, `dist\classsend-agent-win10-x86.exe`) using the modern toolchain with `GOARCH=386`. Warns if `dist\classsend-agent-win7-x86.exe` is missing from a previous `build-win7.bat` run.
+
+### Build / repo
+
+- `cmd/classsend/resource.syso`, `cmd/classsend-agent/resource.syso`, `cmd/monitoring/resource.syso` were x86-64 COFF only; renamed to `resource_amd64.syso` so Go's filename-based architecture filtering links them only on amd64. 32-bit builds compile cleanly but ship without an embedded icon — see Planned for the follow-up.
+
+### Known limitations
+
+- Win7 students do not get the chat TUI. The agent runs and handles every teacher-side command (lock, mute, monitoring, push-open, autostart, etc.); only the student-side chat window is missing.
+- 32-bit builds (`student-win10-x86.exe`, both 32-bit agents) ship without a custom executable icon.
+- Monitoring requires the Microsoft Edge WebView2 runtime on the teacher PC (preinstalled on Win11; auto-installed via Edge on Win10).
 
 ---
 
@@ -139,6 +218,8 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-[Unreleased]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.4-b...HEAD
+[0.0.4-b]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.4-a...v0.0.4-b
+[0.0.4-a]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.2...v0.0.4-a
 [0.0.2]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/kalotrapezis/ClassSend2/releases/tag/v0.0.1
