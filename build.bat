@@ -4,12 +4,16 @@ setlocal
 rem Single source of truth for the version. Bump the trailing letter on each
 rem rebuild so the user can tell which build the EXEs/installer came from.
 rem Must match setup\classsend2.iss MyAppVersion.
-set VERSION=0.0.3
+set VERSION=0.0.4-b
+
+rem build-release.bat may set VERSION_OVERRIDE / RELEASE_FLAGS to ship a clean
+rem versioned, logging-disabled build without editing this file.
+if not "%VERSION_OVERRIDE%"=="" set VERSION=%VERSION_OVERRIDE%
 
 rem ISO-8601 build timestamp via PowerShell (wmic is deprecated on modern Windows).
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'"`) do set BUILDTIME=%%I
 
-set VFLAGS=-X classsend/internal/buildinfo.Version=%VERSION% -X classsend/internal/buildinfo.BuildTime=%BUILDTIME%
+set VFLAGS=-X classsend/internal/buildinfo.Version=%VERSION% -X classsend/internal/buildinfo.BuildTime=%BUILDTIME% %RELEASE_FLAGS%
 
 echo Building teacher.exe   (v%VERSION% built %BUILDTIME%)...
 go build -ldflags="-X main.defaultRole=teacher %VFLAGS%" -o teacher.exe ./cmd/classsend
@@ -29,9 +33,36 @@ if not exist dist mkdir dist
 copy /Y classsend-agent.exe dist\classsend-agent-win10-x64.exe >nul
 if errorlevel 1 goto :err
 
+rem Win10 32-bit pair — modern Go 1.24 toolchain with GOARCH=386. Runs on
+rem Win10/11 x86, but NOT on Win7 (Go 1.21+ dropped Win7 support; that's
+rem what build-win7.bat is for).
+echo Building Win10 x86 student.exe + agent + castviewer...
+set "GOARCH=386"
+go build -ldflags="-X main.defaultRole=student %VFLAGS%" -o dist\student-win10-x86.exe ./cmd/classsend
+if errorlevel 1 (set "GOARCH=" & goto :err)
+go build -ldflags="-H windowsgui %VFLAGS%" -o dist\classsend-agent-win10-x86.exe ./cmd/classsend-agent
+if errorlevel 1 (set "GOARCH=" & goto :err)
+go build -ldflags="-H windowsgui %VFLAGS%" -o dist\castviewer-win10-x86.exe ./cmd/castviewer
+if errorlevel 1 (set "GOARCH=" & goto :err)
+set "GOARCH="
+
 echo Building monitoring.exe...
 go build -ldflags="-H windowsgui %VFLAGS%" -o monitoring.exe ./cmd/monitoring
 if errorlevel 1 goto :err
+
+echo Building castviewer.exe...
+go build -ldflags="-H windowsgui %VFLAGS%" -o castviewer.exe ./cmd/castviewer
+if errorlevel 1 goto :err
+
+rem Win7 agent must already be in dist/ (built separately by build-win7.bat
+rem because Go 1.20 can't parse the modern go.mod directive). Warn loudly if
+rem missing or stale relative to source — the installer needs it.
+if not exist dist\classsend-agent-win7-x86.exe (
+    echo.
+    echo WARNING: dist\classsend-agent-win7-x86.exe missing.
+    echo          Run build-win7.bat to build the Win7 32-bit agent before
+    echo          shipping the installer.
+)
 
 echo.
 echo Done v%VERSION%:
@@ -55,7 +86,7 @@ if "%ISCC%"=="" (
 echo.
 echo Building installer...
 if not exist dist mkdir dist
-"%ISCC%" setup\classsend2.iss
+"%ISCC%" /DMyAppVersion=%VERSION% setup\classsend2.iss
 if errorlevel 1 goto :err
 
 echo   dist\ClassSend2-Setup-v%VERSION%.exe  -- installer for teacher or student PC

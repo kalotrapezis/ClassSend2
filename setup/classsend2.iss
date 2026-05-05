@@ -1,5 +1,9 @@
 #define MyAppName      "ClassSend 2"
-#define MyAppVersion   "0.0.3"
+; Default version — overridable via ISCC /DMyAppVersion=... so build-release.bat
+; can ship a clean version string without editing this file.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.4-b"
+#endif
 #define MyAppPublisher "ClassSend"
 
 ; ── Installer metadata ────────────────────────────────────────────────────────
@@ -36,24 +40,45 @@ Source: "..\teacher.exe";         DestDir: "{app}"; DestName: "classsend.exe"; \
 Source: "..\monitoring.exe";      DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsTeacherRole
 
-; Student
-Source: "..\student.exe";                        DestDir: "{app}"; DestName: "classsend.exe"; \
-    Flags: ignoreversion; Check: IsStudentRole
-Source: "..\dist\classsend-agent-win10-x64.exe"; DestDir: "{app}"; DestName: "classsend-agent.exe"; \
-    Flags: ignoreversion; Check: IsStudentRole and UseModernAgent
-Source: "..\dist\classsend-agent-win7-x86.exe";  DestDir: "{app}"; DestName: "classsend-agent.exe"; \
-    Flags: ignoreversion; Check: IsStudentRole and UseLegacyAgent
+; Student — three-tier matrix:
+;   Win10+ x64 → 64-bit student.exe + 64-bit agent (Go 1.24)
+;   Win10+ x86 → 32-bit student-win10-x86.exe + 32-bit agent-win10-x86.exe
+;                (Go 1.24, full chat TUI)
+;   Win7/8     → 32-bit Go 1.20 agent only (chat TUI not buildable for Win7)
+Source: "..\student.exe";                            DestDir: "{app}"; DestName: "classsend.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModern64
+Source: "..\dist\classsend-agent-win10-x64.exe";     DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModern64
+Source: "..\castviewer.exe";                         DestDir: "{app}"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModern64
+Source: "..\dist\student-win10-x86.exe";             DestDir: "{app}"; DestName: "classsend.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModern32
+Source: "..\dist\classsend-agent-win10-x86.exe";     DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModern32
+Source: "..\dist\castviewer-win10-x86.exe";          DestDir: "{app}"; DestName: "castviewer.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseModern32
+Source: "..\dist\classsend-agent-win7-x86.exe";      DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsStudentRole and UseLegacy32
+; Win7 has no WebView2 runtime, so no castviewer is shipped — CmdStartCast
+; on a Win7 student is a no-op (the agent logs and continues).
 
-; Dev — all four exes, teacher.exe kept as teacher.exe (not renamed)
+; Dev — all four exes, teacher.exe kept as teacher.exe (not renamed). Dev
+; install is for testing on the developer's modern PC, so the modern student/
+; teacher binaries are unconditional; the legacy agent variant is also
+; included so installer-time selection still works under test.
 Source: "..\teacher.exe";                        DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
 Source: "..\student.exe";                        DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
 Source: "..\dist\classsend-agent-win10-x64.exe"; DestDir: "{app}"; DestName: "classsend-agent.exe"; \
-    Flags: ignoreversion; Check: IsDevRole and UseModernAgent
+    Flags: ignoreversion; Check: IsDevRole and UseModern64
+Source: "..\dist\classsend-agent-win10-x86.exe"; DestDir: "{app}"; DestName: "classsend-agent.exe"; \
+    Flags: ignoreversion; Check: IsDevRole and UseModern32
 Source: "..\dist\classsend-agent-win7-x86.exe";  DestDir: "{app}"; DestName: "classsend-agent.exe"; \
-    Flags: ignoreversion; Check: IsDevRole and UseLegacyAgent
+    Flags: ignoreversion; Check: IsDevRole and UseLegacy32
 Source: "..\monitoring.exe";                     DestDir: "{app}"; Flags: ignoreversion; \
+    Check: IsDevRole
+Source: "..\castviewer.exe";                     DestDir: "{app}"; Flags: ignoreversion; \
     Check: IsDevRole
 
 ; about.md ships next to every install. The TUI's --about reads this at
@@ -66,9 +91,9 @@ Source: "..\about.md"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autodesktop}\ClassSend 2 (Δάσκαλος)"; Filename: "{app}\classsend.exe"; \
     Comment: "ClassSend 2 — Teacher"; Check: IsTeacherRole
 
-; Student
+; Student — chat shortcut only on modern systems (where student.exe ships).
 Name: "{autodesktop}\ClassSend 2"; Filename: "{app}\classsend.exe"; \
-    Comment: "ClassSend 2 — Μαθητής"; Check: IsStudentRole
+    Comment: "ClassSend 2 — Μαθητής"; Check: IsStudentRole and UseModernAgent
 
 ; Dev — separate shortcuts for each exe
 Name: "{autodesktop}\ClassSend 2 — Teacher";  Filename: "{app}\teacher.exe"; \
@@ -80,7 +105,7 @@ Name: "{autodesktop}\ClassSend 2 — Student";  Filename: "{app}\student.exe"; \
 
 ; Start Menu
 Name: "{group}\ClassSend 2";                  Filename: "{app}\classsend.exe"; \
-    Check: not IsDevRole
+    Check: (IsTeacherRole) or (IsStudentRole and UseModernAgent)
 Name: "{group}\ClassSend 2 — Teacher";        Filename: "{app}\teacher.exe"; \
     Parameters: "--dev"; Check: IsDevRole
 Name: "{group}\ClassSend 2 — Agent (dev)";    Filename: "{app}\classsend-agent.exe"; \
@@ -115,11 +140,11 @@ Filename: "{app}\classsend.exe"; \
     Description: "Launch ClassSend 2 now"; \
     Flags: nowait postinstall skipifsilent; Check: IsTeacherRole
 
-; Student — start agent silently, offer to open TUI
+; Student — start agent silently, offer to open TUI (modern systems only)
 Filename: "{app}\classsend-agent.exe"; Flags: nowait; Check: IsStudentRole
 Filename: "{app}\classsend.exe"; \
     Description: "Open ClassSend 2 chat now"; \
-    Flags: nowait postinstall skipifsilent; Check: IsStudentRole
+    Flags: nowait postinstall skipifsilent; Check: IsStudentRole and UseModernAgent
 
 ; Dev — start agent with --dev, offer to open both sides
 Filename: "{app}\classsend-agent.exe"; Parameters: "--dev"; Flags: nowait; Check: IsDevRole
@@ -141,16 +166,36 @@ begin
   Result := Ver.Major >= 10;
 end;
 
-function UseModernAgent: Boolean;
+// Three-tier binary matrix:
+//   Win10+ x64 → UseModern64  (64-bit Go 1.24, full TUI)
+//   Win10+ x86 → UseModern32  (32-bit Go 1.24, full TUI)
+//   Win7/8     → UseLegacy32  (32-bit Go 1.20, agent only)
+
+function UseModern64: Boolean;
 begin
-  // Win10+ x64 gets the native 64-bit agent
   Result := IsWin64 and IsWin10OrLater;
 end;
 
+function UseModern32: Boolean;
+begin
+  Result := (not IsWin64) and IsWin10OrLater;
+end;
+
+function UseLegacy32: Boolean;
+begin
+  Result := not IsWin10OrLater;
+end;
+
+// Modern = either bitness on Win10+, where the chat TUI ships.
+function UseModernAgent: Boolean;
+begin
+  Result := IsWin10OrLater;
+end;
+
+// Legacy = Win7/8, agent only (no TUI).
 function UseLegacyAgent: Boolean;
 begin
-  // Win7/8 (any bitness) and Win10 x86 get the 32-bit Go 1.20 agent
-  Result := not UseModernAgent;
+  Result := not IsWin10OrLater;
 end;
 
 var

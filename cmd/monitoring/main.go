@@ -1,28 +1,34 @@
-// monitoring.exe — ClassSend teacher monitoring window.
+// monitoring.exe — ClassSend teacher monitoring window (WebView2 backend).
 //
 // Build:
 //
 //	go build -ldflags="-H windowsgui" -o monitoring.exe ./cmd/monitoring
 //
-// This program opens a native Win32 window with a grid of cells — one per
-// connected student. It connects to the named pipe \\.\pipe\ClassSendMonitor
-// created by classsend.exe and receives screenshots one-by-one, displaying
-// them as they arrive. Old frames are replaced in-place to keep memory use
-// flat.
+// Replaces the previous ~1100-line hand-rolled GDI grid with a thin WebView2
+// host. The pipe protocol with classsend.exe is identical (MsgInit / MsgShot /
+// MsgOffline / MsgStop / MsgFocus), so the teacher side did not change.
+//
+// Architecture:
+//
+//	classsend.exe ──named pipe── monitoring.exe ──Eval(js)── WebView2 (HTML)
+//	                                  ▲
+//	                                  └── Bind("onCellClick") ── click events
+//
+// Each MsgShot from the pipe is base64-encoded and pushed to the page via
+// w.Eval("applyShot(idx, '...')"). The page applies it as an <img> src. Clicks
+// arrive via the bound `onCellClick` function and are forwarded to classsend
+// as MsgFocus on the same pipe.
 package main
 
 import (
-	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"image"
-	"image/draw"
-	"image/jpeg"
 	"io"
-	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,56 +36,30 @@ import (
 
 	"classsend/internal/buildinfo"
 	"classsend/internal/devlog"
+
+	webview2 "github.com/jchv/go-webview2"
 )
 
-// ── Win32 API bindings ────────────────────────────────────────────────────────
+// ── Pipe protocol (must match internal/monitoring/session_windows.go) ─────────
+
+const (
+	msgInit    uint32 = 1
+	msgShot    uint32 = 2
+	msgOffline uint32 = 3
+	msgStop    uint32 = 4
+	msgFocus   uint32 = 5
+
+	focusUnset uint32 = 0xFFFFFFFF
+)
+
+// ── Win32 API for pipe I/O (same overlapped helpers as before) ────────────────
 
 var (
-	user32   = syscall.NewLazyDLL("user32.dll")
-	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	user32   = syscall.NewLazyDLL("user32.dll")
 
-	// Window lifecycle
-	procRegisterClassExW = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
-	procShowWindow       = user32.NewProc("ShowWindow")
-	procDefWindowProcW   = user32.NewProc("DefWindowProcW")
-	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
-	procGetMessageW      = user32.NewProc("GetMessageW")
-	procTranslateMessage = user32.NewProc("TranslateMessage")
-	procDispatchMessageW = user32.NewProc("DispatchMessageW")
-	procInvalidateRect   = user32.NewProc("InvalidateRect")
-	procGetClientRect    = user32.NewProc("GetClientRect")
-	procPostMessageW     = user32.NewProc("PostMessageW")
-	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
-	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
-	procSetWindowTextW   = user32.NewProc("SetWindowTextW")
-	procLoadCursorW      = user32.NewProc("LoadCursorW")
+	procSetWindowPos = user32.NewProc("SetWindowPos")
 
-	// Painting / GDI
-	procBeginPaint             = user32.NewProc("BeginPaint")
-	procEndPaint               = user32.NewProc("EndPaint")
-	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
-	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
-	procSelectObject           = gdi32.NewProc("SelectObject")
-	procDeleteObject           = gdi32.NewProc("DeleteObject")
-	procDeleteDC               = gdi32.NewProc("DeleteDC")
-	procBitBlt                 = gdi32.NewProc("BitBlt")
-	procSetDIBits              = gdi32.NewProc("SetDIBits")
-	procSetDIBitsToDevice      = gdi32.NewProc("SetDIBitsToDevice")
-	procStretchBlt             = gdi32.NewProc("StretchBlt")
-	procStretchDIBits          = gdi32.NewProc("StretchDIBits")
-	procFillRect               = user32.NewProc("FillRect")
-	procCreateSolidBrush       = gdi32.NewProc("CreateSolidBrush")
-	procDrawTextW              = user32.NewProc("DrawTextW")
-	procSetTextColor           = gdi32.NewProc("SetTextColor")
-	procSetBkMode              = gdi32.NewProc("SetBkMode")
-	procCreateFontW            = gdi32.NewProc("CreateFontW")
-	procSetStretchBltMode      = gdi32.NewProc("SetStretchBltMode")
-	procSetBrushOrgEx          = gdi32.NewProc("SetBrushOrgEx")
-
-	// Named pipe (client side) — overlapped I/O on the data path so a wedged
-	// read or write can be cancelled instead of freezing the whole process.
 	procCreateFileW         = kernel32.NewProc("CreateFileW")
 	procReadFile            = kernel32.NewProc("ReadFile")
 	procWriteFile           = kernel32.NewProc("WriteFile")
@@ -92,50 +72,7 @@ var (
 	procResetEvent          = kernel32.NewProc("ResetEvent")
 )
 
-// ── Win32 constants ───────────────────────────────────────────────────────────
-
 const (
-	wsOverlappedWindow = 0x00CF0000
-	wsVisible          = 0x10000000
-	csHredraw          = 0x0002
-	csVredraw          = 0x0001
-	swShow             = 5
-	smCxScreen         = 0
-	smCyScreen         = 1
-
-	wmDestroy      = 0x0002
-	wmPaint        = 0x000F
-	wmSize         = 0x0005
-	wmClose        = 0x0010
-	wmKeydown      = 0x0100
-	wmLbuttondown  = 0x0201
-	wmUser         = 0x0400
-	wmUpdate       = wmUser + 1 // custom: grid data changed — repaint
-	wmPipeEOF      = wmUser + 2 // custom: pipe closed by classsend
-
-	vkEscape = 0x1B
-
-	// Pipe protocol — back-channel (monitoring → classsend)
-	msgFocus uint32 = 5
-
-	// Sentinel: leave focus mode and resume the grid round-robin.
-	focusUnset uint32 = 0xFFFFFFFF
-
-	srcCopy      = 0x00CC0020
-	dibRgbColors = 0
-	transparent  = 1
-	// HALFTONE (4) silently returns 0 for every StretchDIBits after the
-	// first when the destination is a memory DC with non-integer scaling
-	// — observed on real hardware, confirmed in logs. COLORONCOLOR (3) is
-	// the safe choice; quality difference is invisible at thumbnail size.
-	colorOnColor = 3
-
-	dtCenter    = 0x00000001
-	dtVcenter   = 0x00000004
-	dtSingleline = 0x00000020
-	dtWordBreak  = 0x00000010
-	dtLeft       = 0x00000000
-
 	genericRead        = 0x80000000
 	genericWrite       = 0x40000000
 	openExisting       = 3
@@ -148,535 +85,21 @@ const (
 	waitTimeout    = 0x00000102
 	infinite       = 0xFFFFFFFF
 
-	// Pipe protocol types — must match session_windows.go
-	msgInit    uint32 = 1
-	msgShot    uint32 = 2
-	msgOffline uint32 = 3
-	msgStop    uint32 = 4
+	// SetWindowPos constants for the always-on-top toggle.
+	hwndTopmost   = ^uintptr(0) // HWND_TOPMOST   = (HWND)-1
+	hwndNotopmost = ^uintptr(1) // HWND_NOTOPMOST = (HWND)-2
+	swpNosize     = 0x0001
+	swpNomove     = 0x0002
+	swpNoactivate = 0x0010
 )
 
-// ── Win32 structures ──────────────────────────────────────────────────────────
-
-type wndClassExW struct {
-	cbSize        uint32
-	style         uint32
-	lpfnWndProc   uintptr
-	cbClsExtra    int32
-	cbWndExtra    int32
-	hInstance     uintptr
-	hIcon         uintptr
-	hCursor       uintptr
-	hbrBackground uintptr
-	lpszMenuName  *uint16
-	lpszClassName *uint16
-	hIconSm       uintptr
+func setWindowTopmost(hwnd uintptr, on bool) {
+	zorder := uintptr(hwndNotopmost)
+	if on {
+		zorder = hwndTopmost
+	}
+	procSetWindowPos.Call(hwnd, zorder, 0, 0, 0, 0, swpNomove|swpNosize|swpNoactivate)
 }
-
-type paintStruct struct {
-	hdc         uintptr
-	fErase      int32
-	rcPaint     winRect
-	fRestore    int32
-	fIncUpdate  int32
-	rgbReserved [32]byte
-}
-
-type winRect struct {
-	Left, Top, Right, Bottom int32
-}
-
-type winMsg struct {
-	hwnd    uintptr
-	message uint32
-	wParam  uintptr
-	lParam  uintptr
-	time    uint32
-	pt      [2]int32
-}
-
-type bitmapInfoHeader struct {
-	biSize          uint32
-	biWidth         int32
-	biHeight        int32
-	biPlanes        uint16
-	biBitCount      uint16
-	biCompression   uint32
-	biSizeImage     uint32
-	biXPelsPerMeter int32
-	biYPelsPerMeter int32
-	biClrUsed       uint32
-	biClrImportant  uint32
-}
-
-
-// ── Grid state ────────────────────────────────────────────────────────────────
-
-type cellState struct {
-	name    string
-	pixels  []byte // BGRA top-down, len = imgW*imgH*4; nil = no screenshot yet
-	imgW    int32
-	imgH    int32
-	offline bool
-}
-
-var (
-	gridMu   sync.RWMutex
-	cells    []cellState
-	mainHwnd uintptr
-
-	wndProcCallback uintptr
-
-	// Pipe handle for the back-channel (monitoring → classsend) — set once
-	// the readPipe goroutine has CreateFile'd it. Click handlers use it to
-	// send MsgFocus events.
-	pipeMu      sync.Mutex
-	pipeHandle  uintptr
-
-	// Focus state: -1 = grid mode, otherwise index of the focused cell.
-	focusMu  sync.RWMutex
-	focusIdx int = -1
-)
-
-func init() {
-	wndProcCallback = syscall.NewCallback(monitorWndProc)
-}
-
-// ── Window procedure ──────────────────────────────────────────────────────────
-
-func monitorWndProc(hwnd, msg, wParam, lParam uintptr) (ret uintptr) {
-	defer func() {
-		if r := recover(); r != nil {
-			devlog.Logf("wndProc PANIC msg=0x%x: %v\n%s", msg, r, debug.Stack())
-			ret = 0
-		}
-	}()
-	switch msg {
-	case wmPaint:
-		paintGrid(hwnd)
-		return 0
-	case wmSize:
-		procInvalidateRect.Call(hwnd, 0, 0)
-		return 0
-	case wmUpdate:
-		procInvalidateRect.Call(hwnd, 0, 0)
-		return 0
-	case wmLbuttondown:
-		// Hit-test: which cell did we click? Toggle focus.
-		x := int32(int16(lParam & 0xFFFF))
-		y := int32(int16((lParam >> 16) & 0xFFFF))
-		idx := hitTestCell(hwnd, x, y)
-		if idx < 0 {
-			return 0
-		}
-		focusMu.Lock()
-		var send uint32
-		if focusIdx == idx {
-			focusIdx = -1
-			send = focusUnset
-		} else {
-			focusIdx = idx
-			send = uint32(idx)
-		}
-		focusMu.Unlock()
-		sendFocusBackChannel(send)
-		procInvalidateRect.Call(hwnd, 0, 0)
-		return 0
-	case wmKeydown:
-		// Esc leaves focus mode.
-		if wParam == vkEscape {
-			focusMu.Lock()
-			wasFocused := focusIdx >= 0
-			focusIdx = -1
-			focusMu.Unlock()
-			if wasFocused {
-				sendFocusBackChannel(focusUnset)
-				procInvalidateRect.Call(hwnd, 0, 0)
-			}
-		}
-		return 0
-	case wmPipeEOF:
-		// classsend closed the pipe (monitoring stopped or crashed)
-		procSetWindowTextW.Call(hwnd,
-			uintptr(unsafe.Pointer(utf16("ClassSend - Παρακολούθηση (Εκτός Σύνδεσης)  ["+buildinfo.String()+"]"))))
-		procInvalidateRect.Call(hwnd, 0, 0)
-		return 0
-	case wmClose, wmDestroy:
-		procPostQuitMessage.Call(0)
-		return 0
-	}
-	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wParam, lParam)
-	return r
-}
-
-// hitTestCell returns the cell index at window coords (x,y), or -1 if the
-// click was on padding or outside the grid.
-func hitTestCell(hwnd uintptr, x, y int32) int {
-	var rc winRect
-	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
-	winW, winH := rc.Right, rc.Bottom
-
-	gridMu.RLock()
-	n := len(cells)
-	gridMu.RUnlock()
-	if n == 0 || winW <= 0 || winH <= 0 {
-		return -1
-	}
-
-	cols := int32(math.Ceil(math.Sqrt(float64(n))))
-	rows := (int32(n) + cols - 1) / cols
-	cellW := winW / cols
-	cellH := winH / rows
-	if cellW <= 0 || cellH <= 0 {
-		return -1
-	}
-	col := x / cellW
-	row := y / cellH
-	idx := int(row*cols + col)
-	if idx < 0 || idx >= n {
-		return -1
-	}
-	return idx
-}
-
-// sendFocusBackChannel writes a MsgFocus message to the duplex pipe so the
-// teacher's session loop can switch between grid and focus polling. Runs on
-// the UI thread (called from wmLbuttondown), so it MUST NOT block the
-// message pump — overlapped I/O with a 2 s timeout guarantees that.
-func sendFocusBackChannel(idx uint32) {
-	pipeMu.Lock()
-	h := pipeHandle
-	pipeMu.Unlock()
-	if h == 0 {
-		devlog.Logf("focus click: no pipe handle yet, dropping")
-		return
-	}
-	frame := make([]byte, 12)
-	binary.LittleEndian.PutUint32(frame[0:4], msgFocus)
-	binary.LittleEndian.PutUint32(frame[4:8], 4)
-	binary.LittleEndian.PutUint32(frame[8:12], idx)
-	op, err := newPipeOp()
-	if err != nil {
-		devlog.Logf("focus click: newPipeOp: %v", err)
-		return
-	}
-	defer op.close()
-	if err := pipeWriteAll(h, op, frame, 2*time.Second); err != nil {
-		devlog.Logf("focus click: write failed: %v", err)
-		return
-	}
-	if idx == focusUnset {
-		devlog.Logf("focus click: sent UNFOCUS")
-	} else {
-		devlog.Logf("focus click: sent FOCUS idx=%d", idx)
-	}
-}
-
-// ── Painting ──────────────────────────────────────────────────────────────────
-
-// Back-buffer state, cached across paints. Recreating the memory DC and
-// compatible bitmap on every WM_PAINT (50+ Hz during a window resize) was
-// trashing GDI state — SetDIBitsToDevice/StretchDIBits returned 0 on
-// random frames. Caching them eliminates the churn.
-var (
-	bbHdc    uintptr
-	bbBmp    uintptr
-	bbOldBmp uintptr
-	bbW      int32
-	bbH      int32
-)
-
-// ensureBackBuffer (re)creates the cached memory DC + bitmap if the window
-// size changed. Called from paintGrid; safe to call repeatedly.
-func ensureBackBuffer(hdc uintptr, w, h int32) {
-	if bbHdc != 0 && bbW == w && bbH == h {
-		return
-	}
-	if bbHdc != 0 {
-		procSelectObject.Call(bbHdc, bbOldBmp)
-		procDeleteObject.Call(bbBmp)
-		procDeleteDC.Call(bbHdc)
-		bbHdc, bbBmp, bbOldBmp = 0, 0, 0
-	}
-	bbHdc, _, _ = procCreateCompatibleDC.Call(hdc)
-	bbBmp, _, _ = procCreateCompatibleBitmap.Call(hdc, uintptr(w), uintptr(h))
-	bbOldBmp, _, _ = procSelectObject.Call(bbHdc, bbBmp)
-	bbW, bbH = w, h
-}
-
-func paintGrid(hwnd uintptr) {
-	var ps paintStruct
-	hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-	devlog.Logf("paintGrid  cells=%d", func() int { gridMu.RLock(); defer gridMu.RUnlock(); return len(cells) }())
-
-	var rc winRect
-	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
-	winW := rc.Right
-	winH := rc.Bottom
-
-	// Double-buffer with a CACHED memory DC + bitmap. Only recreated on size
-	// change. The final defer just blits the back buffer to the screen.
-	ensureBackBuffer(hdc, winW, winH)
-	hdcMem := bbHdc
-	defer func() {
-		procBitBlt.Call(hdc, 0, 0, uintptr(winW), uintptr(winH), hdcMem, 0, 0, srcCopy)
-	}()
-
-	// Background
-	bgBrush, _, _ := procCreateSolidBrush.Call(0x00111111)
-	fullRc := winRect{0, 0, winW, winH}
-	procFillRect.Call(hdcMem, uintptr(unsafe.Pointer(&fullRc)), bgBrush)
-	procDeleteObject.Call(bgBrush)
-
-	gridMu.RLock()
-	snapshot := make([]cellState, len(cells))
-	copy(snapshot, cells)
-	gridMu.RUnlock()
-
-	focusMu.RLock()
-	curFocus := focusIdx
-	focusMu.RUnlock()
-
-	// Focus mode: paint just the focused cell, full window.
-	if curFocus >= 0 && curFocus < len(snapshot) {
-		hFont, _, _ := procCreateFontW.Call(
-			i32(-14), 0, 0, 0,
-			600, 0, 0, 0,
-			1, 0, 0, 4, 0,
-			uintptr(unsafe.Pointer(utf16("Segoe UI"))),
-		)
-		origFont, _, _ := procSelectObject.Call(hdcMem, hFont)
-		procSetStretchBltMode.Call(hdcMem, uintptr(colorOnColor))
-		paintCell(hdcMem, 0, 0, winW, winH, &snapshot[curFocus])
-
-		// Top-right exit hint badge so the user knows how to leave focus mode.
-		hint := utf16("  Esc ή κλικ για έξοδο  ")
-		const hintW, hintH = int32(220), int32(28)
-		hintRc := winRect{winW - hintW - 12, 12, winW - 12, 12 + hintH}
-		hintBg, _, _ := procCreateSolidBrush.Call(0x00CC2222) // BGR red
-		procFillRect.Call(hdcMem, uintptr(unsafe.Pointer(&hintRc)), hintBg)
-		procDeleteObject.Call(hintBg)
-		procSetBkMode.Call(hdcMem, uintptr(transparent))
-		procSetTextColor.Call(hdcMem, 0x00FFFFFF)
-		procDrawTextW.Call(hdcMem, uintptr(unsafe.Pointer(hint)), ^uintptr(0),
-			uintptr(unsafe.Pointer(&hintRc)), dtCenter|dtVcenter|dtSingleline)
-
-		procSelectObject.Call(hdcMem, origFont)
-		procDeleteObject.Call(hFont)
-		return
-	}
-
-	n := len(snapshot)
-	if n == 0 {
-		procSetBkMode.Call(hdcMem, uintptr(transparent))
-		procSetTextColor.Call(hdcMem, 0x00666666)
-		msg := utf16("Αναμονή σύνδεσης μαθητών...")
-		textRc := winRect{0, 0, winW, winH}
-		procDrawTextW.Call(hdcMem, uintptr(unsafe.Pointer(msg)), ^uintptr(0),
-			uintptr(unsafe.Pointer(&textRc)), dtCenter|dtVcenter|dtSingleline)
-		return
-	}
-
-	cols := int32(math.Ceil(math.Sqrt(float64(n))))
-	rows := (int32(n) + cols - 1) / cols
-	cellW := winW / cols
-	cellH := winH / rows
-
-	// Load shared font for student name labels
-	hFont, _, _ := procCreateFontW.Call(
-		i32(-14), 0, 0, 0,
-		600, 0, 0, 0,
-		1, 0, 0, 4, 0,
-		uintptr(unsafe.Pointer(utf16("Segoe UI"))),
-	)
-	origFont, _, _ := procSelectObject.Call(hdcMem, hFont)
-	defer func() {
-		procSelectObject.Call(hdcMem, origFont)
-		procDeleteObject.Call(hFont)
-	}()
-
-	// COLORONCOLOR — reliable across drivers, no brush-origin requirement.
-	procSetStretchBltMode.Call(hdcMem, uintptr(colorOnColor))
-
-	const pad = int32(2)
-	for idx, cell := range snapshot {
-		col := int32(idx) % cols
-		row := int32(idx) / cols
-		x := col*cellW + pad
-		y := row*cellH + pad
-		cw := cellW - pad*2
-		ch := cellH - pad*2
-		paintCell(hdcMem, x, y, cw, ch, &cell)
-	}
-}
-
-func paintCell(hdc uintptr, x, y, w, h int32, cell *cellState) {
-	// Layout: padded cell, image fits at top preserving aspect, name centered
-	// below the image. Cell background shows through any letterbox area, so
-	// no black bars — the user sees the WHOLE student desktop undistorted.
-	const (
-		cellPad = int32(10) // padding around image+label inside cell
-		nameH   = int32(22) // label strip below image
-		nameGap = int32(6)  // gap between image and label
-	)
-
-	// Cell background (also fills any letterbox area)
-	cellBg := uintptr(0x00181818)
-	if cell.offline {
-		cellBg = 0x001A0000
-	}
-	bg, _, _ := procCreateSolidBrush.Call(cellBg)
-	cellRc := winRect{x, y, x + w, y + h}
-	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&cellRc)), bg)
-	procDeleteObject.Call(bg)
-
-	// Image area: top portion of cell, padded; reserve space below for name.
-	imgArea := winRect{
-		x + cellPad,
-		y + cellPad,
-		x + w - cellPad,
-		y + h - cellPad - nameH - nameGap,
-	}
-	availW := imgArea.Right - imgArea.Left
-	availH := imgArea.Bottom - imgArea.Top
-
-	if len(cell.pixels) > 0 && availW > 0 && availH > 0 {
-		// Aspect-preserving fit (letterbox inside imgArea). The bars are the
-		// cell background colour, not black — looks intentional, not broken.
-		scaleX := float64(availW) / float64(cell.imgW)
-		scaleY := float64(availH) / float64(cell.imgH)
-		scale := scaleX
-		if scaleY < scaleX {
-			scale = scaleY
-		}
-		dstW := int32(float64(cell.imgW) * scale)
-		dstH := int32(float64(cell.imgH) * scale)
-		if dstW < 1 {
-			dstW = 1
-		}
-		if dstH < 1 {
-			dstH = 1
-		}
-		dstX := imgArea.Left + (availW-dstW)/2
-		dstY := imgArea.Top + (availH-dstH)/2
-
-		// CPU-side nearest-neighbour resize to dst size, then 1:1 blit via
-		// SetDIBitsToDevice. SetDIBitsToDevice is documented for "DIB →
-		// device-dependent rectangle" with no scaling, and unlike
-		// StretchDIBits doesn't carry stretch-mode state — it doesn't hit
-		// the intermittent ret=0 bug observed during rapid window resize.
-		var (
-			drawW, drawH int32
-			drawPixels   []byte
-		)
-		if dstW == cell.imgW && dstH == cell.imgH {
-			drawW, drawH, drawPixels = cell.imgW, cell.imgH, cell.pixels
-		} else {
-			drawW, drawH = dstW, dstH
-			drawPixels = resizeBGRA(cell.pixels, cell.imgW, cell.imgH, dstW, dstH)
-		}
-
-		bi := bitmapInfoHeader{
-			biSize:     40,
-			biWidth:    drawW,
-			biHeight:   -drawH, // negative → top-down
-			biPlanes:   1,
-			biBitCount: 32,
-		}
-		ret, _, callErr := procSetDIBitsToDevice.Call(
-			hdc,
-			uintptr(dstX), uintptr(dstY),
-			uintptr(drawW), uintptr(drawH),
-			0, 0, // src x/y
-			0,                // StartScan
-			uintptr(drawH),   // cLines
-			uintptr(unsafe.Pointer(&drawPixels[0])),
-			uintptr(unsafe.Pointer(&bi)),
-			dibRgbColors,
-		)
-		if int32(ret) <= 0 {
-			devlog.Logf("SetDIBitsToDevice FAILED  ret=%d  err=%v  size=%dx%d",
-				int32(ret), callErr, drawW, drawH)
-		}
-	} else if availW > 0 && availH > 0 {
-		// No screenshot yet — show status text in the image area.
-		status := "Αναμονή..."
-		if cell.offline {
-			status = "Εκτός Σύνδεσης"
-		}
-		procSetBkMode.Call(hdc, uintptr(transparent))
-		procSetTextColor.Call(hdc, 0x00555555)
-		statusPtr := utf16(status)
-		procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(statusPtr)), ^uintptr(0),
-			uintptr(unsafe.Pointer(&imgArea)), dtCenter|dtVcenter|dtSingleline)
-	}
-
-	// Name label below the image (mockup-style: hostname under each cell).
-	procSetBkMode.Call(hdc, uintptr(transparent))
-	if cell.offline {
-		procSetTextColor.Call(hdc, 0x004444AA)
-	} else {
-		procSetTextColor.Call(hdc, 0x00DDDDDD)
-	}
-	namePtr := utf16(cell.name)
-	nameRc := winRect{
-		x + cellPad,
-		y + h - cellPad - nameH,
-		x + w - cellPad,
-		y + h - cellPad,
-	}
-	procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(namePtr)), ^uintptr(0),
-		uintptr(unsafe.Pointer(&nameRc)), dtSingleline|dtCenter|dtVcenter)
-}
-
-// resizeBGRA returns a new BGRA buffer of size dstW×dstH, sampled by nearest
-// neighbour from src. We do this on the CPU so the actual blit to the back
-// buffer is a 1:1 StretchDIBits — that path is reliable, while non-integer
-// downscales on memory DCs hit the documented intermittent-failure bug.
-//
-// Performance: at 1080p destination this is ~2 MB of writes per frame and
-// runs in well under a millisecond on any laptop the app would target.
-func resizeBGRA(src []byte, srcW, srcH, dstW, dstH int32) []byte {
-	dst := make([]byte, int(dstW)*int(dstH)*4)
-	if srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 {
-		return dst
-	}
-	srcStride := int(srcW) * 4
-	dstStride := int(dstW) * 4
-	// Pre-compute src x for each dst x to skip the multiply per pixel.
-	xMap := make([]int, dstW)
-	for x := int32(0); x < dstW; x++ {
-		sx := int(int64(x) * int64(srcW) / int64(dstW))
-		if sx >= int(srcW) {
-			sx = int(srcW) - 1
-		}
-		xMap[x] = sx * 4
-	}
-	for y := int32(0); y < dstH; y++ {
-		sy := int(int64(y) * int64(srcH) / int64(dstH))
-		if sy >= int(srcH) {
-			sy = int(srcH) - 1
-		}
-		srcRow := src[sy*srcStride:]
-		dstRow := dst[int(y)*dstStride:]
-		for x := int32(0); x < dstW; x++ {
-			off := xMap[x]
-			dstRow[int(x)*4+0] = srcRow[off+0]
-			dstRow[int(x)*4+1] = srcRow[off+1]
-			dstRow[int(x)*4+2] = srcRow[off+2]
-			dstRow[int(x)*4+3] = srcRow[off+3]
-		}
-	}
-	return dst
-}
-
-// ── Pipe protocol helpers (overlapped I/O) ────────────────────────────────────
-//
-// Why overlapped: synchronous ReadFile/WriteFile on a Win32 byte-mode named
-// pipe can wedge for minutes when the peer's I/O state machine drifts —
-// observed in production with 60+ second blocks on writes that should take
-// microseconds. With FILE_FLAG_OVERLAPPED we wait on an event with a real
-// timeout and CancelIoEx if the operation hangs.
 
 type pipeOp struct {
 	ov    syscall.Overlapped
@@ -684,7 +107,7 @@ type pipeOp struct {
 }
 
 func newPipeOp() (*pipeOp, error) {
-	h, _, e := procCreateEventW.Call(0, 1, 0, 0) // manual reset, nonsignaled
+	h, _, e := procCreateEventW.Call(0, 1, 0, 0)
 	if h == 0 {
 		return nil, fmt.Errorf("CreateEvent: %w", e)
 	}
@@ -706,8 +129,6 @@ func (op *pipeOp) reset() {
 	procResetEvent.Call(op.event)
 }
 
-// pipeWriteAll writes the full buffer with a per-call timeout. CancelIoEx on
-// timeout so the kernel doesn't keep the I/O queued against the OVERLAPPED.
 func pipeWriteAll(handle uintptr, op *pipeOp, data []byte, timeout time.Duration) error {
 	if len(data) == 0 {
 		return nil
@@ -759,8 +180,6 @@ func pipeWriteAll(handle uintptr, op *pipeOp, data []byte, timeout time.Duration
 	return nil
 }
 
-// pipeReadFull reads exactly len(buf) bytes with an overall timeout, looping
-// over partial reads. The timeout starts fresh from the time of the call.
 func pipeReadFull(handle uintptr, op *pipeOp, buf []byte, timeout time.Duration) error {
 	if len(buf) == 0 {
 		return nil
@@ -818,8 +237,6 @@ func pipeReadFull(handle uintptr, op *pipeOp, buf []byte, timeout time.Duration)
 	return nil
 }
 
-// connectPipe retries CreateFile on the pipe for up to 15 seconds. Opens the
-// handle with FILE_FLAG_OVERLAPPED so all subsequent I/O is async-capable.
 func connectPipe() (uintptr, error) {
 	namePtr, _ := syscall.UTF16PtrFromString(`\\.\pipe\ClassSendMonitor`)
 	deadline := time.Now().Add(15 * time.Second)
@@ -841,9 +258,49 @@ func connectPipe() (uintptr, error) {
 	return 0, fmt.Errorf("pipe not available after 15 s")
 }
 
-// readPipe reads messages from the pipe and updates the grid state.
-// Runs in its own goroutine; posts wmUpdate or wmPipeEOF to hwnd.
-func readPipe(handle, hwnd uintptr) {
+// ── State ─────────────────────────────────────────────────────────────────────
+
+var (
+	pipeMu     sync.Mutex
+	pipeHandle uintptr
+
+	wv webview2.WebView
+)
+
+// sendFocusBackChannel forwards a click from the JS side to the teacher.
+// Called from the bound onCellClick (runs on the WebView UI thread).
+func sendFocusBackChannel(idx uint32) {
+	pipeMu.Lock()
+	h := pipeHandle
+	pipeMu.Unlock()
+	if h == 0 {
+		devlog.Logf("focus click: no pipe handle yet, dropping")
+		return
+	}
+	frame := make([]byte, 12)
+	binary.LittleEndian.PutUint32(frame[0:4], msgFocus)
+	binary.LittleEndian.PutUint32(frame[4:8], 4)
+	binary.LittleEndian.PutUint32(frame[8:12], idx)
+	op, err := newPipeOp()
+	if err != nil {
+		devlog.Logf("focus click: newPipeOp: %v", err)
+		return
+	}
+	defer op.close()
+	if err := pipeWriteAll(h, op, frame, 2*time.Second); err != nil {
+		devlog.Logf("focus click: write failed: %v", err)
+		return
+	}
+	if idx == focusUnset {
+		devlog.Logf("focus click: sent UNFOCUS")
+	} else {
+		devlog.Logf("focus click: sent FOCUS idx=%d", idx)
+	}
+}
+
+// ── Pipe reader → JS ──────────────────────────────────────────────────────────
+
+func readPipe(handle uintptr) {
 	defer func() {
 		if r := recover(); r != nil {
 			devlog.Logf("readPipe PANIC: %v\n%s", r, debug.Stack())
@@ -852,31 +309,27 @@ func readPipe(handle, hwnd uintptr) {
 	op, err := newPipeOp()
 	if err != nil {
 		devlog.Logf("readPipe: newPipeOp: %v", err)
-		procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
+		dispatchEval(`setStatus('Σφάλμα σύνδεσης')`)
 		return
 	}
 	defer op.close()
 	hdr := make([]byte, 8)
 
 	for {
-		// Long timeout per header read so we wake periodically; the goroutine
-		// is happy to sit idle for a minute between teacher messages.
 		if err := pipeReadFull(handle, op, hdr, time.Minute); err != nil {
 			devlog.Logf("readPipe: header read err: %v", err)
-			procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
+			dispatchEval(`setStatus('Εκτός σύνδεσης')`)
 			return
 		}
 		msgType := binary.LittleEndian.Uint32(hdr[0:4])
 		payLen := binary.LittleEndian.Uint32(hdr[4:8])
-		devlog.Logf("readPipe: msgType=%d payLen=%d", msgType, payLen)
 
 		var payload []byte
 		if payLen > 0 {
 			payload = make([]byte, payLen)
-			// Once a header arrives, the body should follow within 10 s.
 			if err := pipeReadFull(handle, op, payload, 10*time.Second); err != nil {
 				devlog.Logf("readPipe: payload read err: %v", err)
-				procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
+				dispatchEval(`setStatus('Εκτός σύνδεσης')`)
 				return
 			}
 		}
@@ -884,23 +337,32 @@ func readPipe(handle, hwnd uintptr) {
 		switch msgType {
 		case msgInit:
 			handleInit(payload)
-			devlog.Logf("readPipe: handleInit done")
 		case msgShot:
 			handleShot(payload)
-			devlog.Logf("readPipe: handleShot done")
 		case msgOffline:
 			handleOffline(payload)
-			devlog.Logf("readPipe: handleOffline done")
 		case msgStop:
 			devlog.Logf("readPipe: msgStop received")
-			procPostMessageW.Call(hwnd, wmClose, 0, 0)
+			if wv != nil {
+				wv.Terminate()
+			}
 			return
 		default:
 			devlog.Logf("readPipe: UNKNOWN msgType=%d", msgType)
 		}
-
-		procPostMessageW.Call(hwnd, wmUpdate, 0, 0)
 	}
+}
+
+// dispatchEval pushes a JS snippet to the WebView from any goroutine. Eval
+// itself is async on the UI thread; Dispatch ensures we don't race with
+// webview teardown.
+func dispatchEval(js string) {
+	if wv == nil {
+		return
+	}
+	wv.Dispatch(func() {
+		wv.Eval(js)
+	})
 }
 
 func handleInit(payload []byte) {
@@ -923,71 +385,34 @@ func handleInit(payload []byte) {
 		offset += nameLen
 	}
 
-	gridMu.Lock()
-	defer gridMu.Unlock()
-	newCells := make([]cellState, len(names))
-	for i, name := range names {
-		// Preserve existing screenshot if the student is in the same slot
-		if i < len(cells) && cells[i].name == name {
-			newCells[i] = cells[i]
-		} else {
-			newCells[i] = cellState{name: name}
+	// Build a JS array literal. JSON-escape names defensively.
+	var sb strings.Builder
+	sb.WriteString("applyInit([")
+	for i, n := range names {
+		if i > 0 {
+			sb.WriteByte(',')
 		}
+		sb.WriteString(jsString(n))
 	}
-	cells = newCells
+	sb.WriteString("])")
+	dispatchEval(sb.String())
 }
 
 func handleShot(payload []byte) {
-	defer func() {
-		if r := recover(); r != nil {
-			devlog.Logf("handleShot PANIC: %v\n%s", r, debug.Stack())
-		}
-	}()
 	if len(payload) < 8 {
-		devlog.Logf("handleShot: payload too short  len=%d", len(payload))
 		return
 	}
 	idx := binary.LittleEndian.Uint32(payload[0:4])
 	jpegLen := int(binary.LittleEndian.Uint32(payload[4:8]))
 	if 8+jpegLen > len(payload) {
-		devlog.Logf("handleShot: truncated  jpegLen=%d payload=%d", jpegLen, len(payload))
 		return
 	}
 	jpegData := payload[8 : 8+jpegLen]
+	b64 := base64.StdEncoding.EncodeToString(jpegData)
 
-	// Decode JPEG → RGBA → BGRA (Windows DIB)
-	img, err := jpeg.Decode(bytes.NewReader(jpegData))
-	if err != nil {
-		devlog.Logf("handleShot: jpeg.Decode err: %v", err)
-		return
-	}
-	bounds := img.Bounds()
-	imgW := bounds.Dx()
-	imgH := bounds.Dy()
-
-	// Convert to *image.RGBA efficiently (handles YCbCr, etc.)
-	rgba := image.NewRGBA(image.Rect(0, 0, imgW, imgH))
-	draw.Draw(rgba, rgba.Bounds(), img, bounds.Min, draw.Src)
-
-	// Swap R↔B to get BGRA (Windows DIB format)
-	bgra := make([]byte, imgW*imgH*4)
-	for i := 0; i < imgW*imgH; i++ {
-		bgra[i*4+0] = rgba.Pix[i*4+2] // B
-		bgra[i*4+1] = rgba.Pix[i*4+1] // G
-		bgra[i*4+2] = rgba.Pix[i*4+0] // R
-		bgra[i*4+3] = 0                // reserved
-	}
-
-	gridMu.Lock()
-	defer gridMu.Unlock()
-	if int(idx) < len(cells) {
-		cells[idx].pixels = bgra // old slice is GC-eligible immediately
-		cells[idx].imgW = int32(imgW)
-		cells[idx].imgH = int32(imgH)
-		cells[idx].offline = false
-		devlog.Logf("shot received  idx=%d  %dx%d  jpeg=%dB  bgra=%dB",
-			idx, imgW, imgH, jpegLen, len(bgra))
-	}
+	// applyShot(idx, "<base64>") — JS sets the cell <img src="data:image/jpeg;base64,...">
+	js := fmt.Sprintf("applyShot(%d,'%s')", idx, b64)
+	dispatchEval(js)
 }
 
 func handleOffline(payload []byte) {
@@ -995,21 +420,329 @@ func handleOffline(payload []byte) {
 		return
 	}
 	idx := binary.LittleEndian.Uint32(payload[0:4])
-	gridMu.Lock()
-	defer gridMu.Unlock()
-	if int(idx) < len(cells) {
-		cells[idx].offline = true
+	dispatchEval(fmt.Sprintf("applyOffline(%d)", idx))
+}
+
+// jsString JSON-encodes a string for safe embedding inside Eval. Names can
+// contain quotes, backslashes, or non-ASCII Greek — escape conservatively.
+func jsString(s string) string {
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			sb.WriteString(`\\`)
+		case '"':
+			sb.WriteString(`\"`)
+		case '\n':
+			sb.WriteString(`\n`)
+		case '\r':
+			sb.WriteString(`\r`)
+		case '\t':
+			sb.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&sb, `\u%04x`, r)
+			} else {
+				sb.WriteRune(r)
+			}
+		}
 	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── HTML page ─────────────────────────────────────────────────────────────────
 
-func utf16(s string) *uint16 {
-	p, _ := syscall.UTF16PtrFromString(s)
-	return p
-}
+// pageHTML is the entire UI. CSS Grid auto-fits the cells to the window;
+// aspect-ratio:16/9 gives a stable cell shape; <img>'s object-fit:contain
+// preserves the screenshot's own aspect ratio inside the cell.
+//
+// Frames arrive via applyShot(idx, base64). The image element is reused —
+// only its src attribute changes, so the browser can decode incrementally
+// and the layout doesn't reflow on every frame.
+const pageHTML = `<!doctype html>
+<html lang="el">
+<head>
+<meta charset="utf-8">
+<title>ClassSend - Παρακολούθηση</title>
+<style>
+  :root {
+    --bg: #111;
+    --cell-bg: #181818;
+    --cell-bg-offline: #1a0000;
+    --label: #ddd;
+    --label-offline: #4444aa;
+    --muted: #555;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    height: 100%; width: 100%;
+    background: var(--bg);
+    color: var(--label);
+    font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+    user-select: none;
+  }
+  #status {
+    position: fixed; top: 8px; left: 8px;
+    color: var(--muted); font-size: 12px;
+    pointer-events: none;
+  }
+  /* Reserve a 26 px strip at the bottom of the viewport for the keyboard
+     hint bar so the cells never extend underneath it. */
+  #grid {
+    display: grid;
+    gap: 6px;
+    padding: 6px;
+    height: calc(100vh - 26px); width: 100vw;
+    grid-auto-rows: 1fr;
+  }
+  #kbd-hint {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0c0c0c;
+    color: var(--muted);
+    font-size: 12px;
+    border-top: 1px solid #1a1a1a;
+    pointer-events: none;
+    z-index: 5;
+  }
+  /* Focus mode hides the hint bar so the focused cell really fills the
+     viewport — Esc still gets the user out. */
+  body.focus #kbd-hint { display: none; }
+  body.focus #grid { height: 100vh; }
+  #grid.empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 16px;
+  }
+  .cell {
+    background: var(--cell-bg);
+    border-radius: 8px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform .08s ease;
+  }
+  .cell:hover { transform: scale(1.005); }
+  .cell.offline { background: var(--cell-bg-offline); }
+  .cell .imgwrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .cell img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: 4px;
+    image-rendering: -webkit-optimize-contrast;
+  }
+  .cell .placeholder {
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .cell .label {
+    text-align: center;
+    color: var(--label);
+    font-weight: 600;
+    margin-top: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cell.offline .label { color: var(--label-offline); }
 
-func i32(n int32) uintptr { return uintptr(uint32(n)) }
+  /* Focus mode: one cell fills the viewport. */
+  body.focus #grid { display: block; padding: 0; }
+  body.focus .cell { display: none; }
+  body.focus .cell.focused {
+    display: flex;
+    width: 100vw; height: 100vh;
+    border-radius: 0;
+    padding: 0;
+  }
+  body.focus .cell.focused .imgwrap { padding: 0; }
+  body.focus .cell.focused .label {
+    position: fixed; bottom: 12px; left: 0; right: 0;
+    background: rgba(0,0,0,.55);
+    padding: 6px 12px;
+    margin: 0;
+  }
+  #exit-hint {
+    display: none;
+    position: fixed; top: 12px; right: 12px;
+    background: #c22;
+    color: #fff;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-weight: 600;
+    z-index: 10;
+    pointer-events: none;
+  }
+  body.focus #exit-hint { display: block; }
+</style>
+</head>
+<body>
+  <div id="status">Αναμονή σύνδεσης μαθητών...</div>
+  <div id="exit-hint">Esc ή κλικ για έξοδο</div>
+  <div id="kbd-hint">F = πλήρης οθόνη · T = πάντα μπροστά</div>
+  <div id="grid" class="empty"></div>
+
+<script>
+  const grid = document.getElementById('grid');
+  const status = document.getElementById('status');
+  let cells = [];      // [{name, img, el}] indexed by pipe idx
+  let focusIdx = -1;
+
+  function setStatus(text) { status.textContent = text || ''; }
+  window.setStatus = setStatus;
+
+  // applyInit rebuilds the grid for a new student list. Existing cells are
+  // matched BY NAME (not slot index) so a student joining/leaving doesn't
+  // wipe everyone else's screenshot.
+  window.applyInit = function(names) {
+    const oldByName = {};
+    for (const c of cells) {
+      if (c.name) oldByName[c.name] = c;
+    }
+    cells = [];
+    grid.innerHTML = '';
+    if (!names || !names.length) {
+      grid.classList.add('empty');
+      grid.textContent = 'Αναμονή σύνδεσης μαθητών...';
+      setStatus('');
+      return;
+    }
+    grid.classList.remove('empty');
+    // Square-ish layout: ceil(sqrt(N)) columns
+    const cols = Math.max(1, Math.ceil(Math.sqrt(names.length)));
+    grid.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const el = document.createElement('div');
+      el.className = 'cell';
+      el.dataset.idx = i;
+      const wrap = document.createElement('div');
+      wrap.className = 'imgwrap';
+      const img = document.createElement('img');
+      img.alt = '';
+      const placeholder = document.createElement('div');
+      placeholder.className = 'placeholder';
+      placeholder.textContent = 'Αναμονή...';
+      wrap.appendChild(placeholder);
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = name;
+      el.appendChild(wrap);
+      el.appendChild(label);
+      el.addEventListener('click', () => toggleFocus(i));
+
+      // Carry over screenshot if same student is still here
+      const prev = oldByName[name];
+      if (prev && prev.lastSrc) {
+        wrap.removeChild(placeholder);
+        img.src = prev.lastSrc;
+        wrap.appendChild(img);
+      }
+
+      cells.push({ name, el, wrap, img, placeholder, lastSrc: prev ? prev.lastSrc : null, offline: false });
+      grid.appendChild(el);
+    }
+    setStatus('');
+  };
+
+  // applyShot replaces the image src for cell idx. The previous src is held
+  // by the browser until the new one decodes, so there is no flash to black
+  // on update — exactly the behaviour the user asked for.
+  window.applyShot = function(idx, b64) {
+    const c = cells[idx];
+    if (!c) return;
+    const src = 'data:image/jpeg;base64,' + b64;
+    c.lastSrc = src;
+    c.img.src = src;
+    if (c.placeholder.parentNode) {
+      c.wrap.removeChild(c.placeholder);
+      c.wrap.appendChild(c.img);
+    }
+    c.offline = false;
+    c.el.classList.remove('offline');
+  };
+
+  // applyOffline tints the cell red but KEEPS the last screenshot — no point
+  // showing a black box just because the latest poll timed out.
+  window.applyOffline = function(idx) {
+    const c = cells[idx];
+    if (!c) return;
+    c.offline = true;
+    c.el.classList.add('offline');
+  };
+
+  function toggleFocus(idx) {
+    if (focusIdx === idx) {
+      // Already focused on this one → exit focus mode.
+      focusIdx = -1;
+      document.body.classList.remove('focus');
+      for (const c of cells) c.el.classList.remove('focused');
+      // 0xFFFFFFFF
+      if (window.onCellClick) window.onCellClick(4294967295);
+      return;
+    }
+    focusIdx = idx;
+    document.body.classList.add('focus');
+    for (let i = 0; i < cells.length; i++) {
+      cells[i].el.classList.toggle('focused', i === idx);
+    }
+    if (window.onCellClick) window.onCellClick(idx);
+  }
+
+  // Keyboard shortcuts (bare letter, no modifier):
+  //   F   toggle fullscreen
+  //   T   toggle always-on-top (host-window z-order, via Go callback)
+  //   Esc exit focus mode (and browser auto-exits fullscreen)
+  let topmost = false;
+  function flashStatus(text) {
+    setStatus(text);
+    setTimeout(() => setStatus(''), 1200);
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA') return;
+    if (ev.key === 'Escape' && focusIdx >= 0) {
+      toggleFocus(focusIdx);
+      return;
+    }
+    const k = ev.key.toLowerCase();
+    if (k === 'f') {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+      ev.preventDefault();
+    } else if (k === 't') {
+      topmost = !topmost;
+      if (window.setTopmost) window.setTopmost(topmost);
+      flashStatus(topmost ? 'Πάντα μπροστά: ON' : 'Πάντα μπροστά: OFF');
+      ev.preventDefault();
+    }
+  });
+</script>
+</body>
+</html>`
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1020,50 +753,44 @@ func main() {
 	defer devlog.Close()
 	devlog.Logf("startup  pid=%d  build=%s  exe=%s", os.Getpid(), buildinfo.String(), os.Args[0])
 
-	hInst, _, _ := procGetModuleHandleW.Call(0)
-	className := utf16("ClassSendMonitor")
-
-	// IDC_ARROW = 32512. Without an hCursor set, Windows shows the wait/busy
-	// cursor permanently because the system has no default to draw.
-	arrowCursor, _, _ := procLoadCursorW.Call(0, uintptr(32512))
-
-	wc := wndClassExW{
-		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
-		style:         0,
-		lpfnWndProc:   wndProcCallback,
-		hInstance:     hInst,
-		hCursor:       arrowCursor,
-		hbrBackground: 0, // painted in WM_PAINT
-		lpszClassName: className,
-	}
-	if r, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
-		fmt.Fprintln(os.Stderr, "RegisterClassEx failed")
+	w := webview2.NewWithOptions(webview2.WebViewOptions{
+		Debug: false,
+		WindowOptions: webview2.WindowOptions{
+			Title:  "ClassSend - Παρακολούθηση Τάξης  [" + buildinfo.String() + "]",
+			Width:  1200,
+			Height: 800,
+			Center: true,
+		},
+	})
+	if w == nil {
+		fmt.Fprintln(os.Stderr, "WebView2 runtime not available. Install Microsoft Edge WebView2 Runtime.")
 		os.Exit(1)
 	}
+	defer w.Destroy()
+	wv = w
 
-	sw, _, _ := procGetSystemMetrics.Call(smCxScreen)
-	sh, _, _ := procGetSystemMetrics.Call(smCyScreen)
-	winW := sw * 3 / 4
-	winH := sh * 3 / 4
-	winX := (sw - winW) / 2
-	winY := (sh - winH) / 2
-
-	hwnd, _, _ := procCreateWindowExW.Call(
-		0,
-		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(utf16("ClassSend - Παρακολούθηση Τάξης  ["+buildinfo.String()+"]"))),
-		wsOverlappedWindow|wsVisible,
-		winX, winY, winW, winH,
-		0, 0, hInst, 0,
-	)
-	if hwnd == 0 {
-		fmt.Fprintln(os.Stderr, "CreateWindow failed")
-		os.Exit(1)
+	// JS → Go bridge: the page calls onCellClick(idx) on click, idx = 0xFFFFFFFF
+	// is the unfocus sentinel (matches the pipe protocol).
+	if err := w.Bind("onCellClick", func(idx uint32) {
+		// Best-effort, on the UI thread; pipeWriteAll has its own 2 s timeout
+		// so this can't freeze the message pump.
+		go sendFocusBackChannel(idx)
+	}); err != nil {
+		devlog.Logf("Bind onCellClick failed: %v", err)
 	}
-	mainHwnd = hwnd
-	procShowWindow.Call(hwnd, swShow)
 
-	// Connect to the classsend pipe in the background
+	// T-key always-on-top toggle, same shape as castviewer.
+	if err := w.Bind("setTopmost", func(on bool) {
+		hwnd := uintptr(unsafe.Pointer(w.Window()))
+		setWindowTopmost(hwnd, on)
+		devlog.Logf("setTopmost: on=%v hwnd=%x", on, hwnd)
+	}); err != nil {
+		devlog.Logf("Bind setTopmost failed: %v", err)
+	}
+
+	w.SetHtml(pageHTML)
+
+	// Connect to the classsend pipe and start streaming frames.
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1073,14 +800,14 @@ func main() {
 		pipe, err := connectPipe()
 		if err != nil {
 			devlog.Logf("pipe connect FAILED: %v", err)
-			procPostMessageW.Call(hwnd, wmPipeEOF, 0, 0)
+			dispatchEval(`setStatus('Δεν βρέθηκε ο δάσκαλος')`)
 			return
 		}
 		pipeMu.Lock()
 		pipeHandle = pipe
 		pipeMu.Unlock()
 		devlog.Logf("pipe connected, entering read loop")
-		readPipe(pipe, hwnd)
+		readPipe(pipe)
 		devlog.Logf("read loop exited, closing pipe")
 		pipeMu.Lock()
 		pipeHandle = 0
@@ -1088,14 +815,5 @@ func main() {
 		procCloseHandle.Call(pipe)
 	}()
 
-	// Win32 message loop
-	var msg winMsg
-	for {
-		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if r == 0 || r == ^uintptr(0) {
-			break
-		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
-	}
+	w.Run()
 }

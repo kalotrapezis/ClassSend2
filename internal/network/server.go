@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -177,6 +178,14 @@ func (s *Server) Students() []*Student {
 	for _, st := range s.students {
 		result = append(result, st)
 	}
+	// Stable order — Go map iteration is randomised, and callers (notably
+	// monitoring's poll loop) treat order changes as "student list changed",
+	// which would trigger a grid re-init on every single tick. Sort by ID
+	// (= MAC when available) so the same set of students always comes out
+	// in the same order.
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
 	return result
 }
 
