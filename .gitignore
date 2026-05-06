@@ -12,6 +12,12 @@ vendor/
 # Claude Code local settings
 .claude/
 
+# Internal design / bug docs — kept locally, not shipped or pushed.
+# Public docs (README.md, CHANGELOG.md, about.md) stay tracked.
+*-BUG.md
+*-DESIGN.md
+CASTING-WEBRTC.md
+
 # IDE / OS
 .vscode/
 .idea/
