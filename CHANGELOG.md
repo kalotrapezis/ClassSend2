@@ -9,6 +9,57 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Planned
+- Bundle a stripped ffmpeg.exe (~25-30 MB) inside the installer so the teacher install is self-contained. v0.0.6 leaves ffmpeg as an external dependency to keep the diff focused; bundling is a follow-up.
+- Optional hardware encoder selection (`h264_nvenc` / `h264_qsv` / `h264_amf`) with auto-detection. v0.0.6 uses libx264 universally — works everywhere, ~10-15% CPU at 1080p30 on a modest i5.
+
+---
+
+## [0.0.6] — 2026-05-06
+
+The cast pipeline is rewritten from JPEG-per-frame to fragmented MP4 / H.264. Bandwidth drops ~30× at the same perceptual quality (≈ 70 KB/s per viewer at 720p30 vs ≈ 2 MB/s before); end-to-end latency is one to two frames; and Chromium's hardware H.264 decoder inside WebView2 does the work on the student side, so we ship zero new decoder code.
+
+The wire envelope is unchanged (`[4-byte BE size][payload]`) but the payload semantics moved from "one JPEG per frame" to "one fMP4 chunk per call". This is a wire-incompatible bump for cast — old viewers (≤ 0.0.5) will read sizes correctly but feed JPEG-expecting code an `ftyp` box and render nothing useful. Installer ships matched binaries on both sides, so this only matters for mixed-version installs.
+
+### Changed
+
+#### Cast wire layer ([internal/network/cast.go](internal/network/cast.go))
+- New `SendFrame(data []byte, kind CastFrameKind)` API. `kind` is one of `FrameInit` (cached, replayed to every new client), `FrameKeyframe` (sync point — every viewer must receive at least one before it can decode), `FrameDelta` (P-frame, only forwarded to in-sync clients).
+- Per-client bounded queue (`castQueueDepth=60` ≈ 2 s of headroom). On overflow the slow client is closed rather than dropping bytes mid-GOP — silent corruption is worse than a brief reconnect.
+- New clients are held in `acceptLoop` until an init segment is published, then receive the cached init first, then skip delta fragments until the next keyframe. With `-g 30` that wait is ≤ 1 s.
+- `CastClient` / `DialCast` removed (dead code since v0.0.4-b).
+
+#### fMP4 box parser ([internal/network/fmp4_box.go](internal/network/fmp4_box.go))
+- New file. `readBox` parses one MP4 box (32-bit and 64-bit sizes); `FMP4Splitter` drives a stream of boxes into `(init, false)` then `(media, false)` pairs, each emit being one logical chunk. Skips `free`/`sidx` and other ancillary boxes ffmpeg can emit.
+- Eleven unit tests in [fmp4_box_test.go](internal/network/fmp4_box_test.go) and [cast_test.go](internal/network/cast_test.go) cover the happy path, truncated/oversized boxes, init-replay-to-new-client, skip-deltas-until-keyframe, and slow-client kill.
+
+#### Teacher producer ([cmd/classsend/syscommands_teacher_windows.go](cmd/classsend/syscommands_teacher_windows.go))
+- Replaced the in-process `image/jpeg` encoder with an `ffmpeg.exe` sidecar. Pipeline: BitBlt → pre-allocated BGRA buffer → ffmpeg stdin → libx264 ultrafast/zerolatency → fMP4 stdout → splitter → `srv.SendFrame`.
+- Capture buffer reused across frames — at 1080p that's 8 MB / frame, so 30 fps × allocate-per-frame would have been ~240 MB/s of GC pressure on the old path.
+- Three goroutines: capture loop (main), drain stderr (logs ffmpeg diagnostics), parse stdout. Shutdown sequence closes stdin → drains parser → waits 2 s → kills if needed.
+- Encoder flags: `-c:v libx264 -preset ultrafast -tune zerolatency -bf 0 -g 30 -keyint_min 30 -profile:v baseline -level 3.1 -pix_fmt yuv420p`. baseline + level 3.1 means MSE codec string `avc1.42E01F`, which Chromium accepts universally.
+- Mux flags: `-f mp4 -movflags +empty_moov+default_base_moof+frag_every_frame`. One fragment per frame so the producer can tag keyframes by index (`mediaIdx % castGOP == 0`) rather than parsing `tfhd` sample flags.
+- `findFFmpegExe()` falls through `CLASSSEND_FFMPEG` env var → beside the running exe → `PATH`. If nothing matches, cast logs a clear "install ffmpeg" message and waits for stop.
+
+#### Student viewer ([cmd/castviewer/main.go](cmd/castviewer/main.go))
+- `<img src="data:image/jpeg;base64,...">` swap replaced by `<video>` + Media Source Extensions. Init segment goes to `applyInit`; media fragments go to `applyFragment`; both decode base64 to `Uint8Array` and append via `sourceBuffer.appendBuffer`.
+- Append queue with `PENDING_MAX=120` cap so a stalled `updateend` can't run the page out of memory. `sourceBuffer.mode = 'sequence'` accepts contiguous fragments without timestamp validation.
+- Multi-NIC dial logic (v0.0.5-b) unchanged.
+
+#### casttest harness ([cmd/casttest/main.go](cmd/casttest/main.go))
+- Rewritten to drive the real ffmpeg pipeline with `-f lavfi -i testsrc=...` instead of generating synthetic JPEG. Verifies the exact code path the teacher uses (encoder, splitter, server, viewer fan-out) without needing a desktop session.
+- Verified clean: 2 viewers, 20 s, 30 fps, **0 dropped frames** across 600 fragments / 1160 deliveries / 22 MB total.
+
+### Added
+
+- `CLASSSEND_FFMPEG` environment variable for development — points at any ffmpeg.exe so you don't have to copy one beside `teacher.exe` for every test build.
+
+### Known limitations / runtime requirements
+
+- **`ffmpeg.exe` must be available** on the teacher PC. The v0.0.6 installer does not bundle it (planned for a follow-up release). Quick install: `winget install Gyan.FFmpeg`. Cast is the only feature that needs it; everything else continues to work.
+- **Late-joining viewers** (a student reopening the cast viewer mid-stream) wait up to ~1 s for the next keyframe before video appears. This is GOP-bound; halving GOP would halve the wait at the cost of bandwidth.
+- **Resolution changes mid-cast** (e.g. plugging in an external monitor while broadcasting) require a cast restart — the encoder is configured with fixed `-s WxH` at startup.
+
+---
 - `^1`–`^0` tool shortcut keys
 - Persistent teacher daemon (session survives TUI close)
 - System tray icon for student agent
