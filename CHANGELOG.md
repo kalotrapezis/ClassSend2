@@ -14,7 +14,7 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [0.0.7-a] — 2026-05-06
+## [0.0.7] — 2026-05-06
 
 Cast is now self-contained: a fresh teacher install can broadcast immediately, no separate ffmpeg installation required. Cost is installer size — 18 MB → 60 MB — but the teacher PC already has plenty of disk to spare and IT admins no longer need a second `winget install` step.
 
@@ -31,7 +31,7 @@ Cast is now self-contained: a fresh teacher install can broadcast immediately, n
 
 ### Compatibility
 
-- **No wire-format change.** v0.0.7-a teachers and v0.0.6 students (or the reverse) work identically — the only difference is whether ffmpeg is bundled or pulled in separately.
+- **No wire-format change.** v0.0.7 teachers and v0.0.6 students (or the reverse) work identically — the only difference is whether ffmpeg is bundled or pulled in separately.
 - Old (≤ 0.0.5) installers / binaries still incompatible at the cast layer — that break landed in v0.0.6.
 
 ---
