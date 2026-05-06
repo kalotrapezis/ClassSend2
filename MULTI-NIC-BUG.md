@@ -1,8 +1,18 @@
 # Bug: Multi-NIC teacher only advertises one subnet
 
-**Status:** open as of v0.0.4 (2026-05-06)
-**Severity:** any student on a subnet whose teacher NIC is *not* `nics[0]` cannot connect.
+**Status:** FIXED in v0.0.5-a (2026-05-06).
+**Severity (was):** any student on a subnet whose teacher NIC is *not* `nics[0]` cannot connect.
 **Scope:** chat / monitoring / casting all affected — different fixes needed for each.
+
+## Fix landed
+
+- `Scanner` no longer holds a single `serverAddr`; it holds `serverPort` and computes the dial-back address per-target. `scanAll` uses each NIC's IP for that NIC's subnet sweep; `fastPath`/retry use `advertiseAddrFor(studentIP)` which subnet-matches against `GetLocalNICs()`. Pure helper `pickAdvertiseAddr` is unit-tested in [internal/network/scanner_test.go](internal/network/scanner_test.go) with the canonical two-subnet scenario (Stud1 192.168.1.15 → NIC-A, Stud2 10.20.2.17 → NIC-B).
+- `CastServer.LocalAddr()` now returns all NIC addresses comma-separated. `castviewer.exe` parses the list and dials each in order — first success wins. The `CmdStartCast.Param` wire field is unchanged (free-form string), so no protocol bump.
+- Old castviewer.exe binaries (≤ v0.0.4) on a multi-NIC teacher will see a comma-separated string, fail to dial, and exit cleanly. Acceptable for the v0.0.5 bump; a fresh installer ships the new viewer.
+
+## Original analysis below — kept for context.
+
+---
 
 ## Symptom
 

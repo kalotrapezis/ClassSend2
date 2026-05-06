@@ -164,6 +164,20 @@ func New(app *core.App) *Model {
 		m.events <- evCmdFailed{nickname: nickname, action: action, errMsg: errMsg}
 	}
 
+	// Bootstrap: if the agent already reported "connected to teacher" before
+	// OnConnected was wired (race when the agent had cached state and replayed
+	// a TypeConnected frame the instant ConnectViaAgent dialed), synthesise
+	// the event now so the TUI leaves the "searching" screen on first paint.
+	if app.Role == core.RoleStudent && app.IsConnectedToTeacher() {
+		// Non-blocking — m.events has buffer; if it ever doesn't, a goroutine
+		// keeps us out of the constructor's call path.
+		select {
+		case m.events <- evConnected{}:
+		default:
+			go func() { m.events <- evConnected{} }()
+		}
+	}
+
 	// Teacher is always "connected" (they own the class)
 	if app.Role == core.RoleTeacher {
 		m.connected = true
