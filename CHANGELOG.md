@@ -18,6 +18,37 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.0.5-b] — 2026-05-06
+
+Two pre-existing classroom bugs: a teacher with two NICs on different subnets could only serve students on `nics[0]`, and the student TUI sometimes stayed on "searching" even though the agent had already connected. Both fixed and covered by regression tests.
+
+### Fixed
+
+#### Multi-NIC teacher
+- **`Scanner` advertises the right IP per subnet.** [internal/network/scanner.go](internal/network/scanner.go) used to bake `nics[0].IP` into a single `serverAddr` string at construction. It now holds `serverPort` and computes a per-NIC dial-back address: `scanAll` uses each NIC's IP for that NIC's subnet sweep; `fastPath`/retry use a new pure helper `pickAdvertiseAddr(studentIP, port, nics)` that subnet-matches against `GetLocalNICs()`. Students on the second subnet now receive an IP they can actually route to.
+- **`CastServer.LocalAddr()` returns all NIC addresses comma-separated** ([internal/network/cast.go](internal/network/cast.go)). [cmd/castviewer/main.go](cmd/castviewer/main.go) parses the list and dials each in order with a 3 s per-candidate timeout — first success wins. `CmdStartCast.Param` wire format unchanged (free-form string), so no protocol bump. Old castviewer binaries (≤ 0.0.4) on a multi-NIC teacher will fail to dial; the new installer ships the new viewer.
+- **`MAC cache` already persists** to `mac_cache.json` and survives reboots, so the new per-IP advertise lookup makes dual-mode networks work across nights for free — `fastPath` probes each cached IP with the right teacher-side NIC IP automatically.
+- **Single-NIC cost is essentially zero**: `fastPath`/retry snapshot `GetLocalNICs()` once per call instead of per cached IP, and `LocalAddr()` returns one `"ip:port"` string with no comma.
+
+#### "Agent connected but TUI stuck on searching" race
+Diagnosed as two distinct races, both fixed:
+- **Agent-side IPC write interleaving.** [cmd/classsend-agent/main.go](cmd/classsend-agent/main.go): `replayHistoryToTUI` and the event hooks (`OnConnected`, `OnDisconnected`, `OnRawMessage`) both wrote JSON+newline frames to the same loopback conn with no serialisation. Concurrent writes could tear each other's frames; the TUI's `bufio.Scanner` then read a half-frame, failed to parse, and silently `continue`'d. Fixed with `tuiWriteMu` — every write to `tuiConn` now goes through `writeToTUI()` which holds that mutex briefly.
+- **TUI bootstrap race** (the actual bug witnessed). `app.ConnectViaAgent(conn)` was called *before* `tui.New(app)` set `OnConnected`. The agent's first `TypeConnected` frame from the history replay landed at `ConnectViaAgent`'s switch with `OnConnected==nil` and was silently dropped. Fixed by mirroring the agent's connection state in `App.agentConnected atomic.Bool` (set inside the IPC handler regardless of hook wiring) and exposing it via `IsConnectedToTeacher()`. `tui.New` queries it after wiring hooks and synthesises an `evConnected` if needed — so the TUI never misses the initial transition.
+- **Bonus**: `replayHistoryToTUI` re-checks `IsConnected()` at the end and re-emits `TypeConnected` if the agent finished its TCP connect during the replay itself. Closes the TOCTOU between the initial check and the replay actually finishing.
+
+### Added
+
+- **`internal/network/scanner_test.go`** — `TestPickAdvertiseAddr_*` covers the canonical 192.168.1.x / 10.20.2.x scenario, the off-subnet/no-NIC fallbacks, and 127.0.0.1 (dev mode + loopback probes).
+- **`cmd/classsend-agent/main_test.go`** — `TestWriteToTUI_NoInterleaving` runs 8 writers × 200 frames concurrently and asserts every line on the receiving side parses as a clean `ipc.Frame`.
+- **`internal/core/state_test.go`** — `TestIsConnectedToTeacher_BootstrapRace` verifies that a `TypeConnected` frame arriving before any hook is wired still updates `IsConnectedToTeacher()`. `TestIsConnectedToTeacher_LateOnConnected` verifies the late-hook synthesis path that `tui.New` relies on.
+
+### Build / repo
+
+- Version bumped 0.0.4-b → 0.0.5-b. `set VERSION=` in [build.bat](build.bat) and `MyAppVersion` in [setup/classsend2.iss](setup/classsend2.iss) updated together.
+- [MULTI-NIC-BUG.md](MULTI-NIC-BUG.md) updated: the bug analysis is preserved, the file now leads with a "FIXED in v0.0.5-b" header pointing at the implementation.
+
+---
+
 ## [0.0.4-b] — 2026-05-05
 
 Cast viewer rewritten on WebView2 to match the monitoring rewrite from 0.0.4-a. Same architectural reasoning: stop fighting GDI's `StretchDIBits` quirks, hand the pixel pipeline to a real browser engine.
@@ -218,7 +249,8 @@ The `[Code]` block in `setup/classsend2.iss` exposes three predicates — `UseMo
 
 ---
 
-[Unreleased]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.4-b...HEAD
+[Unreleased]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.5-b...HEAD
+[0.0.5-b]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.4-b...v0.0.5-b
 [0.0.4-b]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.4-a...v0.0.4-b
 [0.0.4-a]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.2...v0.0.4-a
 [0.0.2]: https://github.com/kalotrapezis/ClassSend2/compare/v0.0.1...v0.0.2
