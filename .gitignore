@@ -23,3 +23,6 @@ CASTING-WEBRTC.md
 .idea/
 Thumbs.db
 Desktop.ini
+
+# castviewer/casttest devlog output during local testing
+/logs/

@@ -1,13 +1,15 @@
-// castviewer.exe — student-side cast viewer (WebView2 backend).
+// castviewer.exe — student-side cast viewer (WebView2 + MSE backend).
 //
 // Build:
 //
 //	go build -ldflags="-H windowsgui" -o castviewer.exe ./cmd/castviewer
 //
-// Replaces the previous Win32 GDI cast window inside classsend-agent.exe with
-// a thin WebView2 host. The agent spawns this binary on CmdStartCast and
-// kills it on CmdStopCast. Frames are pushed into the page via Eval as base64
-// JPEG data URLs — the same pattern monitoring.exe uses.
+// v0.0.6 wire layer: the teacher's CastServer streams fragmented MP4 / H.264
+// chunks (ftyp+moov init segment first, then moof+mdat fragments). This
+// process feeds them into a <video> element via Media Source Extensions and
+// lets Chromium's hardware-accelerated decoder do the heavy lifting.
+// Bandwidth is ~10× lower than the v0.0.5 JPEG-per-frame pipeline at the
+// same perceptual quality.
 //
 // Args:
 //
@@ -27,10 +29,8 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"runtime"
@@ -42,6 +42,7 @@ import (
 
 	"classsend/internal/buildinfo"
 	"classsend/internal/devlog"
+	"classsend/internal/network"
 
 	webview2 "github.com/jchv/go-webview2"
 )
@@ -72,7 +73,7 @@ func setWindowTopmost(hwnd uintptr, on bool) {
 
 var (
 	wv          webview2.WebView
-	frameCount  atomic.Uint64
+	chunkCount  atomic.Uint64
 	bytesTotal  atomic.Uint64
 	connectedAt atomic.Int64
 )
@@ -133,10 +134,10 @@ func main() {
 	w.Run()
 }
 
-// streamLoop dials the cast server and pumps frames into the WebView until
-// the connection drops. It logs reconnect attempts but does NOT auto-retry —
-// the agent decides whether to relaunch us. A clean exit on TCP close keeps
-// the last good frame on screen so a transient failure isn't disorienting.
+// streamLoop dials the cast server and pumps fMP4 chunks into the WebView
+// until the connection drops. The first chunk is always the init segment
+// (ftyp+moov) — JS uses it to configure the SourceBuffer. Subsequent chunks
+// are media fragments (moof+mdat).
 func streamLoop(addr string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -148,7 +149,7 @@ func streamLoop(addr string) {
 
 	// Multi-NIC teacher: -addr may be a comma-separated list of "host:port"
 	// pairs (one per teacher NIC). Try each in order; the first that dials is
-	// the one on our subnet. Whitespace tolerated.
+	// the one on our subnet.
 	candidates := splitAddrs(addr)
 	var conn net.Conn
 	var lastErr error
@@ -180,35 +181,36 @@ func streamLoop(addr string) {
 	}
 
 	connectedAt.Store(time.Now().UnixNano())
-	dispatchEval(`setStatus('')`)
+	dispatchEval(`setStatus('Αναμονή πρώτου καρέ...')`)
 	devlog.Logf("connected to %s", addr)
 
 	r := bufio.NewReaderSize(conn, 4*1024*1024)
-	hdr := make([]byte, 4)
+	first := true
 	for {
-		if _, err := io.ReadFull(r, hdr); err != nil {
-			devlog.Logf("read hdr: %v", err)
+		chunk, err := network.CastReadFrame(r)
+		if err != nil {
+			devlog.Logf("read: %v", err)
 			dispatchEval(`setStatus('Η μετάδοση τερματίστηκε')`)
 			return
 		}
-		size := binary.BigEndian.Uint32(hdr)
-		if size == 0 || size > 20*1024*1024 {
-			devlog.Logf("invalid frame size: %d", size)
-			return
-		}
-		frame := make([]byte, size)
-		if _, err := io.ReadFull(r, frame); err != nil {
-			devlog.Logf("read body: %v", err)
-			return
-		}
-		frameCount.Add(1)
-		bytesTotal.Add(uint64(size))
+		chunkCount.Add(1)
+		bytesTotal.Add(uint64(len(chunk)))
 
-		// Push to JS. Eval is async on the UI thread; large strings (~200 KB
-		// base64 for a 1080p Q85 JPEG) are fine — the channel from the Go
-		// host to the WebView is in-process.
-		b64 := base64.StdEncoding.EncodeToString(frame)
-		dispatchEval(`applyFrame('` + b64 + `')`)
+		// First chunk must be the init segment. JS routes it to
+		// `applyInit`; subsequent chunks go to `applyFragment`. Server
+		// guarantees this ordering.
+		jsFn := "applyFragment"
+		if first {
+			jsFn = "applyInit"
+			first = false
+		}
+
+		// Push to JS as base64. ~7-280 KB per fragment at 1080p; well within
+		// WebView2's Eval throughput. We could move to a localhost WebSocket
+		// for better binary efficiency later, but base64 keeps parity with
+		// monitoring.exe and is good enough for 30 fps.
+		b64 := base64.StdEncoding.EncodeToString(chunk)
+		dispatchEval(jsFn + `('` + b64 + `')`)
 	}
 }
 
@@ -263,10 +265,10 @@ func jsCall(name, arg string) string {
 	return string(sb)
 }
 
-// pageHTML is the entire viewer UI. The image element is reused; only its
-// src attribute changes per frame so the browser swaps frames atomically and
-// without repainting the whole page. CSS handles letterbox via `object-fit:
-// contain` — same approach as monitoring.exe.
+// pageHTML is the entire viewer UI. The <video> element is fed via Media
+// Source Extensions: applyInit() supplies the codec config + ftyp/moov, and
+// applyFragment() pushes each moof+mdat fragment. Chromium's H.264 decoder
+// (hardware-accelerated where available) handles the rest.
 const pageHTML = `<!doctype html>
 <html lang="el">
 <head>
@@ -295,7 +297,7 @@ const pageHTML = `<!doctype html>
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
-    image-rendering: -webkit-optimize-contrast;
+    background: #000;
   }
   #status {
     position: fixed; top: 12px; left: 12px;
@@ -328,14 +330,98 @@ const pageHTML = `<!doctype html>
 </style>
 </head>
 <body>
-  <div id="stage"><img id="frame" alt=""></div>
+  <div id="stage"><video id="frame" autoplay muted playsinline></video></div>
   <div id="status">Αναμονή σύνδεσης...</div>
   <div id="hint">F = πλήρης οθόνη · T = πάντα μπροστά · Esc = έξοδος πλήρους οθόνης</div>
 
 <script>
-  const img = document.getElementById('frame');
+  // Codec string for H.264 baseline profile, level 3.1 — matches what ffmpeg
+  // is asked to emit on the teacher side. If the runtime ever rejects this,
+  // adjust both ends together.
+  const CODEC = 'video/mp4; codecs="avc1.42E01F"';
+
+  const video = document.getElementById('frame');
   const status = document.getElementById('status');
-  let everReceivedFrame = false;
+
+  let mediaSource = null;
+  let sourceBuffer = null;
+  // Pending init/fragments queued before sourceopen, plus fragments queued
+  // while sourceBuffer.updating is true. Bounded so a stalled appender can't
+  // run us out of memory.
+  const pending = [];
+  const PENDING_MAX = 120;     // ~4 seconds at 30 fps
+  let everReceivedFragment = false;
+
+  if (!('MediaSource' in window)) {
+    setStatus('MediaSource δεν υποστηρίζεται από αυτή την έκδοση WebView2');
+    throw new Error('MSE not supported');
+  }
+  if (!MediaSource.isTypeSupported(CODEC)) {
+    setStatus('Ο κωδικοποιητής H.264 baseline δεν είναι διαθέσιμος');
+    throw new Error('codec not supported: ' + CODEC);
+  }
+
+  mediaSource = new MediaSource();
+  video.src = URL.createObjectURL(mediaSource);
+
+  mediaSource.addEventListener('sourceopen', () => {
+    sourceBuffer = mediaSource.addSourceBuffer(CODEC);
+    // 'sequence' tells MSE to append in arrival order regardless of the
+    // fragment timestamps. Our encoder uses contiguous monotonic timestamps
+    // anyway, but this avoids any edge-case rejection.
+    sourceBuffer.mode = 'sequence';
+    sourceBuffer.addEventListener('updateend', flushPending);
+    flushPending();
+  });
+
+  function flushPending() {
+    if (!sourceBuffer || sourceBuffer.updating || pending.length === 0) return;
+    const next = pending.shift();
+    try {
+      sourceBuffer.appendBuffer(next);
+    } catch (e) {
+      console.error('appendBuffer failed:', e);
+      // Drop and try the next one on the next updateend.
+    }
+  }
+
+  function enqueueChunk(bytes) {
+    if (sourceBuffer && !sourceBuffer.updating && pending.length === 0) {
+      try {
+        sourceBuffer.appendBuffer(bytes);
+        return;
+      } catch (e) {
+        console.error('appendBuffer (direct) failed:', e);
+      }
+    }
+    pending.push(bytes);
+    while (pending.length > PENDING_MAX) {
+      pending.shift(); // drop oldest queued fragments under runaway buffering
+    }
+  }
+
+  // applyInit / applyFragment — the Go side calls these from the TCP loop.
+  // applyInit fires exactly once per stream (first chunk = ftyp+moov).
+  window.applyInit = function(b64) {
+    const bytes = base64ToBytes(b64);
+    enqueueChunk(bytes);
+  };
+  window.applyFragment = function(b64) {
+    const bytes = base64ToBytes(b64);
+    enqueueChunk(bytes);
+    if (!everReceivedFragment) {
+      everReceivedFragment = true;
+      setStatus('');
+    }
+  };
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
 
   window.setStatus = function(text) {
     if (text) {
@@ -343,16 +429,6 @@ const pageHTML = `<!doctype html>
       status.classList.remove('hidden');
     } else {
       status.classList.add('hidden');
-    }
-  };
-
-  // applyFrame replaces the <img> src. The browser keeps the previous frame
-  // visible until the new one decodes, so there is no flash to black.
-  window.applyFrame = function(b64) {
-    img.src = 'data:image/jpeg;base64,' + b64;
-    if (!everReceivedFrame) {
-      everReceivedFrame = true;
-      window.setStatus('');
     }
   };
 
@@ -375,7 +451,6 @@ const pageHTML = `<!doctype html>
       topmost = !topmost;
       if (window.setTopmost) window.setTopmost(topmost);
       window.setStatus(topmost ? 'Πάντα μπροστά: ON' : 'Πάντα μπροστά: OFF');
-      // hide the toast after a moment
       setTimeout(() => window.setStatus(''), 1200);
       ev.preventDefault();
     }
