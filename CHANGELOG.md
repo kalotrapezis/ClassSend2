@@ -9,12 +9,12 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Planned
-- Bundle a stripped ffmpeg.exe (~25-30 MB) inside the installer so the teacher install is self-contained. v0.0.6-a leaves ffmpeg as an external dependency to keep the diff focused; bundling is a follow-up.
-- Optional hardware encoder selection (`h264_nvenc` / `h264_qsv` / `h264_amf`) with auto-detection. v0.0.6-a uses libx264 universally — works everywhere, ~10-15% CPU at 1080p30 on a modest i5.
+- Bundle a stripped ffmpeg.exe (~25-30 MB) inside the installer so the teacher install is self-contained. v0.0.6 leaves ffmpeg as an external dependency to keep the diff focused; bundling is a follow-up.
+- Optional hardware encoder selection (`h264_nvenc` / `h264_qsv` / `h264_amf`) with auto-detection. v0.0.6 uses libx264 universally — works everywhere, ~10-15% CPU at 1080p30 on a modest i5.
 
 ---
 
-## [0.0.6-a] — 2026-05-06
+## [0.0.6] — 2026-05-06
 
 The cast pipeline is rewritten from JPEG-per-frame to fragmented MP4 / H.264. Bandwidth drops ~30× at the same perceptual quality (≈ 70 KB/s per viewer at 720p30 vs ≈ 2 MB/s before); end-to-end latency is one to two frames; and Chromium's hardware H.264 decoder inside WebView2 does the work on the student side, so we ship zero new decoder code.
 
@@ -55,7 +55,7 @@ The wire envelope is unchanged (`[4-byte BE size][payload]`) but the payload sem
 
 ### Known limitations / runtime requirements
 
-- **`ffmpeg.exe` must be available** on the teacher PC. The v0.0.6-a installer does not bundle it (planned for v0.0.6-b). Quick install: `winget install Gyan.FFmpeg`. Cast is the only feature that needs it; everything else continues to work.
+- **`ffmpeg.exe` must be available** on the teacher PC. The v0.0.6 installer does not bundle it (planned for a follow-up release). Quick install: `winget install Gyan.FFmpeg`. Cast is the only feature that needs it; everything else continues to work.
 - **Late-joining viewers** (a student reopening the cast viewer mid-stream) wait up to ~1 s for the next keyframe before video appears. This is GOP-bound; halving GOP would halve the wait at the cost of bandwidth.
 - **Resolution changes mid-cast** (e.g. plugging in an external monitor while broadcasting) require a cast restart — the encoder is configured with fixed `-s WxH` at startup.
 
