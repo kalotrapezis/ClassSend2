@@ -4,7 +4,7 @@ setlocal
 rem Single source of truth for the version. Bump the trailing letter on each
 rem rebuild so the user can tell which build the EXEs/installer came from.
 rem Must match setup\classsend2.iss MyAppVersion.
-set VERSION=0.0.6
+set VERSION=0.0.7
 
 rem build-release.bat may set VERSION_OVERRIDE / RELEASE_FLAGS to ship a clean
 rem versioned, logging-disabled build without editing this file.
@@ -62,6 +62,19 @@ if not exist dist\classsend-agent-win7-x86.exe (
     echo WARNING: dist\classsend-agent-win7-x86.exe missing.
     echo          Run build-win7.bat to build the Win7 32-bit agent before
     echo          shipping the installer.
+)
+
+rem Bundled ffmpeg.exe powers the optional Teacher Screen Casting installer
+rem component. The binary is ~200 MB and isn't tracked in git — fetch-ffmpeg.bat
+rem downloads BtbN's static GPL build into third_party\ffmpeg\. The Inno Setup
+rem step below will fail loudly if it's missing, but warn earlier here so the
+rem fix is obvious.
+if not exist third_party\ffmpeg\ffmpeg.exe (
+    echo.
+    echo WARNING: third_party\ffmpeg\ffmpeg.exe missing.
+    echo          Run fetch-ffmpeg.bat to download it. Without it the installer
+    echo          step will fail. The bundled ffmpeg is what powers the
+    echo          optional "Teacher Screen Casting" component.
 )
 
 echo.

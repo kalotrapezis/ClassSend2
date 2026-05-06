@@ -9,8 +9,30 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Planned
-- Bundle a stripped ffmpeg.exe (~25-30 MB) inside the installer so the teacher install is self-contained. v0.0.6 leaves ffmpeg as an external dependency to keep the diff focused; bundling is a follow-up.
-- Optional hardware encoder selection (`h264_nvenc` / `h264_qsv` / `h264_amf`) with auto-detection. v0.0.6 uses libx264 universally — works everywhere, ~10-15% CPU at 1080p30 on a modest i5.
+- Custom-built minimal ffmpeg (libx264 + mp4 mux + rawvideo demux only). The currently-bundled BtbN GPL build is statically-linked but full-featured — ~200 MB on disk. A purpose-built minimal would be 10-15 MB; the installer would shrink from 60 MB back toward ~30 MB.
+- Optional hardware encoder selection (`h264_nvenc` / `h264_qsv` / `h264_amf`) with auto-detection. v0.0.7 still uses libx264 universally — works everywhere, ~10-15% CPU at 1080p30 on a modest i5.
+
+---
+
+## [0.0.7] — 2026-05-06
+
+Cast is now self-contained: a fresh teacher install can broadcast immediately, no separate ffmpeg installation required. Cost is installer size — 18 MB → 60 MB — but the teacher PC already has plenty of disk to spare and IT admins no longer need a second `winget install` step.
+
+### Added
+
+- **Bundled ffmpeg.exe** in [third_party/ffmpeg/](third_party/ffmpeg/) (BtbN's static GPL build, ~200 MB on disk, ~42 MB inside the installer thanks to LZMA2 ultra64). Powers the H.264 cast pipeline added in v0.0.6. Not committed to git (well above GitHub's 100 MB per-file limit) — [`fetch-ffmpeg.bat`](fetch-ffmpeg.bat) at the repo root pulls the latest BtbN release on demand. The Inno Setup compile step fails loudly if it's missing.
+- **"Teacher Screen Casting" component** on the installer's role page. Checked by default for Teacher / Dev installs, automatically disabled (greyed + unchecked) when Student is selected — students decode the H.264 stream natively in WebView2 and don't need ffmpeg. Skipping the component drops the installed footprint by ~200 MB and the installer download by ~42 MB. The checkbox sits below the role selection so the installer page now reads as: pick role → opt out of casting if you don't need it.
+- **`fetch-ffmpeg.bat`** at the repo root. Idempotent download + extract of BtbN's GPL build into `third_party/ffmpeg/`. Safe to run on a clean clone; skips silently if the binary is already present. Documented in [third_party/ffmpeg/README.md](third_party/ffmpeg/README.md) including the GPL note.
+
+### Changed
+
+- **`build.bat` warns** if `third_party\ffmpeg\ffmpeg.exe` is missing, pointing the developer at `fetch-ffmpeg.bat`. The Inno Setup step still fails hard on a missing file — the warning is just an earlier signal.
+- Installer compresses ~80 s longer because of ffmpeg.exe (LZMA2 ultra64 on a 200 MB binary). Still inside the build budget.
+
+### Compatibility
+
+- **No wire-format change.** v0.0.7 teachers and v0.0.6 students (or the reverse) work identically — the only difference is whether ffmpeg is bundled or pulled in separately.
+- Old (≤ 0.0.5) installers / binaries still incompatible at the cast layer — that break landed in v0.0.6.
 
 ---
 

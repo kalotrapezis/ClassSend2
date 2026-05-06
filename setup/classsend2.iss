@@ -2,7 +2,7 @@
 ; Default version — overridable via ISCC /DMyAppVersion=... so build-release.bat
 ; can ship a clean version string without editing this file.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.6"
+  #define MyAppVersion "0.0.7"
 #endif
 #define MyAppPublisher "ClassSend"
 
@@ -84,6 +84,21 @@ Source: "..\castviewer.exe";                     DestDir: "{app}"; Flags: ignore
 ; about.md ships next to every install. The TUI's --about reads this at
 ; runtime, so its content can be edited post-install without rebuilding.
 Source: "..\about.md"; DestDir: "{app}"; Flags: ignoreversion
+
+; ── Teacher Screen Casting (optional, ~200 MB) ────────────────────────────────
+; Bundled ffmpeg.exe powers the H.264 cast pipeline (teacher → students). It is
+; only meaningful on a teacher install — students decode the stream natively in
+; WebView2 with no extra dependency. Gated on the IncludeCasting check, which
+; honours the "Teacher Screen Casting" checkbox on the role page (checked by
+; default for Teacher / Dev, disabled for Student).
+;
+; The binary is NOT in git (~200 MB > GitHub's per-file limit). Run
+; fetch-ffmpeg.bat at the repo root to download it before building the
+; installer. Inno Setup will fail loudly here if the file is missing.
+Source: "..\third_party\ffmpeg\ffmpeg.exe";   DestDir: "{app}"; \
+    Flags: ignoreversion; Check: IncludeCasting
+Source: "..\third_party\ffmpeg\LICENSE.txt";  DestDir: "{app}"; DestName: "ffmpeg-LICENSE.txt"; \
+    Flags: ignoreversion; Check: IncludeCasting
 
 ; ── Shortcuts ─────────────────────────────────────────────────────────────────
 [Icons]
@@ -199,13 +214,15 @@ begin
 end;
 
 var
-  RolePage:    TWizardPage;
+  RolePage:     TWizardPage;
   TeacherRadio: TNewRadioButton;
   StudentRadio: TNewRadioButton;
   DevRadio:     TNewRadioButton;
   TeacherDesc:  TNewStaticText;
   StudentDesc:  TNewStaticText;
   DevDesc:      TNewStaticText;
+  CastCheckbox: TNewCheckBox;
+  CastDesc:     TNewStaticText;
 
 function IsTeacherRole: Boolean;
 begin
@@ -227,6 +244,35 @@ begin
   if IsTeacherRole then Result := 'teacher'
   else if IsDevRole then Result := 'dev'
   else                   Result := 'student';
+end;
+
+// IncludeCasting gates ffmpeg.exe in [Files]. True when the user has the
+// "Teacher Screen Casting" checkbox checked AND their role uses casting
+// (Teacher or Dev — Student installs decode the stream natively and don't
+// need ffmpeg). The checkbox is auto-disabled when Student is selected so
+// this is mostly belt-and-suspenders.
+function IncludeCasting: Boolean;
+begin
+  Result := (CastCheckbox <> nil) and CastCheckbox.Checked
+            and (IsTeacherRole or IsDevRole);
+end;
+
+// Called when any role radio is clicked. Disables the cast checkbox for
+// Student installs (where ffmpeg has no use) and re-enables/restores the
+// default for Teacher/Dev.
+procedure RoleChanged(Sender: TObject);
+begin
+  if CastCheckbox = nil then
+    Exit;
+  if IsStudentRole then begin
+    CastCheckbox.Checked := False;
+    CastCheckbox.Enabled := False;
+    CastDesc.Enabled     := False;
+  end else begin
+    CastCheckbox.Enabled := True;
+    CastCheckbox.Checked := True;
+    CastDesc.Enabled     := True;
+  end;
 end;
 
 procedure CreateRolePage;
@@ -297,6 +343,41 @@ begin
     Width   := RolePage.SurfaceWidth - 32;
     Parent  := RolePage.Surface;
   end;
+
+  { ── Teacher Screen Casting (optional dependency) ── }
+  CastCheckbox := TNewCheckBox.Create(RolePage);
+  with CastCheckbox do begin
+    Caption := 'Teacher Screen Casting';
+    Top     := 168;
+    Left    := 16;
+    Width   := RolePage.SurfaceWidth - 16;
+    Parent  := RolePage.Surface;
+    Font.Style := [fsBold];
+    Checked := True;
+  end;
+
+  CastDesc := TNewStaticText.Create(RolePage);
+  with CastDesc do begin
+    Caption := 'Adds ~200 MB. Bundles ffmpeg.exe so the teacher can broadcast their ' +
+               'screen as live video to students. Only useful on a teacher install — ' +
+               'student installs decode the stream natively without it.';
+    Top     := 188;
+    Left    := 32;
+    Width   := RolePage.SurfaceWidth - 32;
+    Height  := 36;
+    AutoSize := False;
+    WordWrap := True;
+    Parent  := RolePage.Surface;
+  end;
+
+  { Wire radio buttons so toggling role updates the checkbox state. }
+  TeacherRadio.OnClick := @RoleChanged;
+  StudentRadio.OnClick := @RoleChanged;
+  DevRadio.OnClick     := @RoleChanged;
+
+  { Apply initial state — Student is the default radio so cast box should
+    start disabled, but RoleChanged will set it correctly. }
+  RoleChanged(nil);
 end;
 
 procedure InitializeWizard;
