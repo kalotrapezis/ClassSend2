@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,14 +49,24 @@ func NewCastServer() (*CastServer, error) {
 	return s, nil
 }
 
-// LocalAddr returns "LAN_IP:port" — the address students should connect to.
+// LocalAddr returns the address(es) students should dial to receive the cast.
+//
+// On a single-NIC teacher this is "LAN_IP:port". On a multi-NIC teacher, all
+// NIC IPs are returned comma-separated: "192.168.1.50:47821,10.0.0.50:47821".
+// Each student tries them in order; only the one on its own subnet succeeds.
+// The CmdStartCast.Param wire field is a free-form string, so this fits
+// without a protocol bump — but castviewer.exe must know to split on commas.
 func (s *CastServer) LocalAddr() string {
 	nics := GetLocalNICs()
 	if len(nics) == 0 {
 		return s.ln.Addr().String()
 	}
 	_, port, _ := net.SplitHostPort(s.ln.Addr().String())
-	return net.JoinHostPort(nics[0].IP.String(), port)
+	addrs := make([]string, 0, len(nics))
+	for _, nic := range nics {
+		addrs = append(addrs, net.JoinHostPort(nic.IP.String(), port))
+	}
+	return strings.Join(addrs, ",")
 }
 
 // ClientCount returns the number of currently connected students.

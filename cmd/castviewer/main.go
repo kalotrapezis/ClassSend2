@@ -34,6 +34,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -145,13 +146,33 @@ func streamLoop(addr string) {
 
 	dispatchEval(`setStatus('Σύνδεση στον δάσκαλο...')`)
 
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		devlog.Logf("dial %s: %v", addr, err)
-		dispatchEval(jsCall("setStatus", "Δεν βρέθηκε ο δάσκαλος: "+err.Error()))
+	// Multi-NIC teacher: -addr may be a comma-separated list of "host:port"
+	// pairs (one per teacher NIC). Try each in order; the first that dials is
+	// the one on our subnet. Whitespace tolerated.
+	candidates := splitAddrs(addr)
+	var conn net.Conn
+	var lastErr error
+	var dialedAddr string
+	for _, cand := range candidates {
+		c, err := net.DialTimeout("tcp", cand, 3*time.Second)
+		if err == nil {
+			conn = c
+			dialedAddr = cand
+			break
+		}
+		devlog.Logf("dial %s: %v", cand, err)
+		lastErr = err
+	}
+	if conn == nil {
+		msg := "Δεν βρέθηκε ο δάσκαλος"
+		if lastErr != nil {
+			msg = msg + ": " + lastErr.Error()
+		}
+		dispatchEval(jsCall("setStatus", msg))
 		return
 	}
 	defer conn.Close()
+	addr = dialedAddr
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
@@ -198,6 +219,21 @@ func dispatchEval(js string) {
 	wv.Dispatch(func() {
 		wv.Eval(js)
 	})
+}
+
+// splitAddrs parses a comma-separated "host:port[,host:port...]" list into a
+// trimmed slice. Empty / whitespace-only entries are skipped so a stray comma
+// in the teacher's broadcast doesn't add a doomed dial attempt.
+func splitAddrs(s string) []string {
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // jsCall builds a `name("arg")` JS expression with the arg JSON-quoted.

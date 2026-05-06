@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,9 +21,15 @@ const (
 	ReprobeInterval = 5 * time.Second
 )
 
-// Scanner runs on the teacher side — probes IPs looking for student apps
+// Scanner runs on the teacher side — probes IPs looking for student apps.
+//
+// Multi-NIC: the teacher may have several NICs on different subnets. The probe
+// payload tells the student which IP to dial back to, so it must match the
+// subnet the student is reachable on. scanAll attaches the per-NIC IP when
+// scanning that NIC's subnet; fastPath / retry use advertiseAddrFor() which
+// looks up the matching NIC for an arbitrary student IP.
 type Scanner struct {
-	serverAddr string
+	serverPort int
 	onFound    func(ip string, hs protocol.HandshakePayload)
 	// OnMissing is called after each full cycle for each cached student not found.
 	// count = consecutive miss count for that MAC.
@@ -37,14 +44,47 @@ type Scanner struct {
 	cycleFound sync.Map       // MACs found in the current scan cycle
 }
 
-func NewScanner(serverAddr string, devMode bool, onFound func(string, protocol.HandshakePayload)) *Scanner {
+func NewScanner(serverPort int, devMode bool, onFound func(string, protocol.HandshakePayload)) *Scanner {
 	return &Scanner{
-		serverAddr: serverAddr,
+		serverPort: serverPort,
 		onFound:    onFound,
 		devMode:    devMode,
 		retryIPs:   make(map[string]struct{}),
 		missCounts: make(map[string]int),
 	}
+}
+
+// advertiseAddrFor returns "ip:port" for the NIC whose subnet contains studentIP.
+func (s *Scanner) advertiseAddrFor(studentIP string) string {
+	return pickAdvertiseAddr(studentIP, s.serverPort, GetLocalNICs())
+}
+
+// pickAdvertiseAddr is the pure logic behind advertiseAddrFor — exposed for
+// testing without real network interfaces.
+//
+// Falls back to the first NIC if no match (covers cached IPs whose NIC is
+// gone). 127.0.0.1 maps to itself so dev mode and loopback probes still work.
+func pickAdvertiseAddr(studentIP string, port int, nics []NICInfo) string {
+	portStr := strconv.Itoa(port)
+	if studentIP == "127.0.0.1" {
+		return net.JoinHostPort("127.0.0.1", portStr)
+	}
+	ip := net.ParseIP(studentIP)
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
+	if ip != nil {
+		for _, nic := range nics {
+			ipnet := &net.IPNet{IP: nic.IP.Mask(nic.Mask), Mask: nic.Mask}
+			if ipnet.Contains(ip) {
+				return net.JoinHostPort(nic.IP.String(), portStr)
+			}
+		}
+	}
+	if len(nics) > 0 {
+		return net.JoinHostPort(nics[0].IP.String(), portStr)
+	}
+	return net.JoinHostPort("0.0.0.0", portStr)
 }
 
 // AddRetry queues an IP for fast reprobing — call when a student disconnects
@@ -115,14 +155,16 @@ func (s *Scanner) retryLoop(ctx context.Context) {
 
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, ScanConcurrency)
+		nics := GetLocalNICs() // snapshot once per retry batch
 		for _, ip := range ips {
 			ip := ip
+			advAddr := pickAdvertiseAddr(ip, s.serverPort, nics)
 			wg.Add(1)
 			sem <- struct{}{}
 			go func() {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if !s.probe(ip) {
+				if !s.probe(ip, advAddr) {
 					// Still not back — re-queue for next retry
 					s.AddRetry(ip)
 				}
@@ -138,15 +180,19 @@ func (s *Scanner) fastPath(cache *MACCache) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].LastSeen.After(entries[j].LastSeen)
 	})
-	s.probeIPs(func(send func(string)) {
+	// Snapshot NICs once per fastPath — avoids a syscall per cached IP. The
+	// single-NIC common case ends up calling GetLocalNICs() once per 30 s
+	// scan cycle instead of once per cache entry.
+	nics := GetLocalNICs()
+	s.probeIPs(func(send func(ip, advAddr string)) {
 		for _, e := range entries {
 			// Probe all known IPs for this MAC — handles DHCP changes between sessions
 			for _, ip := range e.IPHistory {
-				send(ip)
+				send(ip, pickAdvertiseAddr(ip, s.serverPort, nics))
 			}
 			// LastIP as fallback if history is empty
 			if len(e.IPHistory) == 0 && e.LastIP != "" {
-				send(e.LastIP)
+				send(e.LastIP, pickAdvertiseAddr(e.LastIP, s.serverPort, nics))
 			}
 		}
 	})
@@ -155,6 +201,7 @@ func (s *Scanner) fastPath(cache *MACCache) {
 
 func (s *Scanner) scanAll() {
 	nics := GetLocalNICs()
+	port := strconv.Itoa(s.serverPort)
 	var wg sync.WaitGroup
 
 	if s.devMode {
@@ -163,20 +210,22 @@ func (s *Scanner) scanAll() {
 		go func() {
 			defer wg.Done()
 			for _, nic := range nics {
-				s.probe(nic.IP.String())
+				ownAddr := net.JoinHostPort(nic.IP.String(), port)
+				s.probe(nic.IP.String(), ownAddr)
 			}
-			s.probe("127.0.0.1")
+			s.probe("127.0.0.1", net.JoinHostPort("127.0.0.1", port))
 		}()
 	}
 
 	for _, nic := range nics {
 		nic := nic
+		advAddr := net.JoinHostPort(nic.IP.String(), port)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.probeIPs(func(send func(string)) {
+			s.probeIPs(func(send func(ip, advAddr string)) {
 				for _, ip := range SubnetIPs(nic) {
-					send(ip.String())
+					send(ip.String(), advAddr)
 				}
 			})
 		}()
@@ -184,27 +233,30 @@ func (s *Scanner) scanAll() {
 	wg.Wait()
 }
 
-// probeIPs runs probe() on each IP provided by the generator, with concurrency limit
-func (s *Scanner) probeIPs(gen func(func(string))) {
+// probeIPs runs probe() on each (ip, advAddr) pair provided by the generator,
+// with concurrency limit. advAddr is the "host:port" the student should dial
+// back to — must be on a NIC the student can route to.
+func (s *Scanner) probeIPs(gen func(func(ip, advAddr string))) {
 	sem := make(chan struct{}, ScanConcurrency)
 	var wg sync.WaitGroup
 
-	gen(func(ip string) {
+	gen(func(ip, advAddr string) {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			s.probe(ip)
+			s.probe(ip, advAddr)
 		}()
 	})
 
 	wg.Wait()
 }
 
-// probe connects to one IP's probe port, sends CLASS_HERE, reads handshake preview
-// Returns true if a ClassSend student app responded
-func (s *Scanner) probe(ip string) bool {
+// probe connects to one IP's probe port, sends CLASS_HERE with serverAddr as
+// the dial-back target, reads handshake preview. Returns true if a student
+// responded.
+func (s *Scanner) probe(ip, serverAddr string) bool {
 	addr := fmt.Sprintf("%s:%d", ip, ProbePort)
 	conn, err := net.DialTimeout("tcp", addr, ProbeTimeout)
 	if err != nil {
@@ -216,7 +268,7 @@ func (s *Scanner) probe(ip string) bool {
 	c := protocol.NewConn(conn)
 
 	msg, err := protocol.Encode(protocol.TypeProbe, protocol.ProbePayload{
-		ServerAddr: s.serverAddr,
+		ServerAddr: serverAddr,
 	})
 	if err != nil {
 		return false

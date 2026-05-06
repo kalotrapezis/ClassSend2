@@ -408,9 +408,21 @@ func handleShot(payload []byte) {
 		return
 	}
 	jpegData := payload[8 : 8+jpegLen]
-	b64 := base64.StdEncoding.EncodeToString(jpegData)
 
-	// applyShot(idx, "<base64>") — JS sets the cell <img src="data:image/jpeg;base64,...">
+	// Reject obvious garbage before the page tries to decode it. The agent
+	// occasionally emits zero-byte or truncated frames during a screen lock,
+	// DWM transition, or display sleep/wake — without this guard, the
+	// browser fails the decode, blanks the <img>, and the cell goes black
+	// even though we have a perfectly good previous frame to keep showing.
+	// JPEG SOI marker is 0xFF 0xD8; EOI marker is 0xFF 0xD9.
+	if jpegLen < 4 ||
+		jpegData[0] != 0xFF || jpegData[1] != 0xD8 ||
+		jpegData[jpegLen-2] != 0xFF || jpegData[jpegLen-1] != 0xD9 {
+		devlog.Logf("handleShot: bad JPEG, dropping idx=%d len=%d", idx, jpegLen)
+		return
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(jpegData)
 	js := fmt.Sprintf("applyShot(%d,'%s')", idx, b64)
 	dispatchEval(js)
 }
@@ -666,21 +678,34 @@ const pageHTML = `<!doctype html>
     setStatus('');
   };
 
-  // applyShot replaces the image src for cell idx. The previous src is held
-  // by the browser until the new one decodes, so there is no flash to black
-  // on update — exactly the behaviour the user asked for.
+  // applyShot updates the cell's <img>, but ONLY after the new frame has
+  // successfully decoded in an off-screen Image probe. The visible <img>
+  // keeps its current src until the probe fires onload, so a corrupt or
+  // half-rendered frame can't blank the cell to black on its way to
+  // failure. This pairs with the Go-side JPEG header check — defence in
+  // depth: even if a frame slips past the magic-byte test, a decode
+  // failure here is harmless.
   window.applyShot = function(idx, b64) {
     const c = cells[idx];
     if (!c) return;
     const src = 'data:image/jpeg;base64,' + b64;
-    c.lastSrc = src;
-    c.img.src = src;
-    if (c.placeholder.parentNode) {
-      c.wrap.removeChild(c.placeholder);
-      c.wrap.appendChild(c.img);
-    }
-    c.offline = false;
-    c.el.classList.remove('offline');
+    const probe = new Image();
+    probe.onload = function() {
+      c.lastSrc = src;
+      c.img.src = src;
+      if (c.placeholder.parentNode) {
+        c.wrap.removeChild(c.placeholder);
+        c.wrap.appendChild(c.img);
+      }
+      c.offline = false;
+      c.el.classList.remove('offline');
+    };
+    probe.onerror = function() {
+      // Decode failed — leave the previous frame visible. We don't tint
+      // the cell offline either; a single bad frame doesn't mean the
+      // student is gone, the next poll will likely succeed.
+    };
+    probe.src = src;
   };
 
   // applyOffline tints the cell red but KEEPS the last screenshot — no point

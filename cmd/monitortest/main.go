@@ -85,6 +85,7 @@ const (
 func main() {
 	exePath := flag.String("exe", "monitoring.exe", "path to monitoring.exe")
 	duration := flag.Duration("duration", 0, "auto-quit after this long (0 = forever)")
+	badRate := flag.Float64("bad-rate", 0.0, "fraction of frames to corrupt (0.0–1.0). At 0.05, ~1-in-20 shots is a bad JPEG; the cell should keep its previous good frame, never go black. Use this to verify the bad-frame guard.")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -157,7 +158,34 @@ func main() {
 			origIdx := currentOrder[pos]
 			orderMu.Unlock()
 			st := students[origIdx]
-			jpegBytes := renderShot(st.name, st.hue, 1280, 720, frame)
+
+			// With probability bad-rate, emit a corrupted frame instead of
+			// a real screenshot. Mix the four kinds of garbage we'd
+			// realistically see from the agent in production: empty
+			// payload, truncated JPEG (SOI but no EOI), raw garbage that
+			// looks nothing like a JPEG, and a one-byte sliver. The
+			// monitoring fix is supposed to drop all four and keep the
+			// last good frame visible.
+			var jpegBytes []byte
+			isBad := *badRate > 0 && rand.Float64() < *badRate
+			if isBad {
+				switch rand.Intn(4) {
+				case 0:
+					jpegBytes = nil // zero bytes
+				case 1:
+					good := renderShot(st.name, st.hue, 1280, 720, frame)
+					jpegBytes = good[:len(good)/3] // truncated
+				case 2:
+					jpegBytes = []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE} // garbage
+				case 3:
+					jpegBytes = []byte{0xFF} // sliver
+				}
+				log.Printf("BAD FRAME injected pos=%d kind=%d size=%d (cell %s should keep previous frame, NOT go black)",
+					pos, rand.Intn(4), len(jpegBytes), st.name)
+			} else {
+				jpegBytes = renderShot(st.name, st.hue, 1280, 720, frame)
+			}
+
 			if err := sendShot(pipe, uint32(pos), jpegBytes); err != nil {
 				log.Printf("sendShot pos=%d: %v — exiting", pos, err)
 				return

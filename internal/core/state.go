@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"classsend/internal/ipc"
@@ -80,6 +81,14 @@ type App struct {
 	Probe    *network.ProbeListener // student only
 
 	agentConn net.Conn // set when student TUI talks to background agent instead of teacher directly
+
+	// agentConnected mirrors the agent's "connected to teacher" state on the
+	// TUI side. It's updated by ConnectViaAgent's frame handler when
+	// TypeConnected / TypeDisconnected arrive — independent of whether
+	// OnConnected hooks are wired yet. Lets late-registered hooks query the
+	// current state without racing on dropped events. Atomic so the TUI can
+	// poll it without holding a.mu.
+	agentConnected atomic.Bool
 
 	devMode    bool
 	scanCancel context.CancelFunc
@@ -235,12 +244,11 @@ func (a *App) StartTeacher() error {
 	}
 	a.Server = srv
 
-	// Determine our server address for the scanner probes
-	nics := network.GetLocalNICs()
-	if len(nics) == 0 {
+	// Multi-NIC: scanner picks the right teacher IP per-student based on the
+	// NIC the student is reachable on. We just need at least one active NIC.
+	if len(network.GetLocalNICs()) == 0 {
 		return fmt.Errorf("no active network interfaces found")
 	}
-	serverAddr := fmt.Sprintf("%s:%d", nics[0].IP.String(), network.ServerPort)
 
 	// onFound is called when scanner gets a handshake preview from a student
 	// The student will connect back to us on their own — we just log the preview
@@ -249,7 +257,7 @@ func (a *App) StartTeacher() error {
 		a.Cache.Upsert(hs.MAC, ip, hs.Nickname, hs.Hostname)
 	}
 
-	scanner := network.NewScanner(serverAddr, a.devMode, onFound)
+	scanner := network.NewScanner(network.ServerPort, a.devMode, onFound)
 	scanner.OnMissing = func(mac, nickname, hostname string, count int) {
 		if a.OnStudentMissing != nil {
 			a.OnStudentMissing(mac, nickname, hostname, count)
@@ -315,6 +323,17 @@ func (a *App) Mu() *sync.RWMutex { return &a.mu }
 
 // HasAgentConn reports whether the student TUI is connected to a background agent.
 func (a *App) HasAgentConn() bool { return a.agentConn != nil }
+
+// IsConnectedToTeacher returns the current "connected to teacher" state for
+// either the direct (Client) or agent-mediated student paths. Used by the TUI
+// to bootstrap m.connected at startup so a TypeConnected frame that arrived
+// before OnConnected was wired isn't lost.
+func (a *App) IsConnectedToTeacher() bool {
+	if a.Client != nil {
+		return a.Client.IsConnected()
+	}
+	return a.agentConnected.Load()
+}
 
 // SendNicknameUpdateToAgent pushes a nickname change to the background agent so its
 // outgoing chat messages use the updated name immediately (no restart needed).
@@ -446,10 +465,12 @@ func (a *App) ConnectViaAgent(conn net.Conn) {
 			}
 			switch f.Type {
 			case ipc.TypeConnected:
+				a.agentConnected.Store(true)
 				if a.OnConnected != nil {
 					a.OnConnected()
 				}
 			case ipc.TypeDisconnected:
+				a.agentConnected.Store(false)
 				if a.OnDisconnected != nil {
 					a.OnDisconnected()
 				}

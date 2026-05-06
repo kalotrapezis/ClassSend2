@@ -24,15 +24,34 @@ import (
 var (
 	tuiMu   sync.Mutex
 	tuiConn net.Conn // current TUI connection; at most one at a time
+
+	// tuiWriteMu serialises every write to tuiConn. Without it, replayHistoryToTUI
+	// (history dump on TUI connect) races OnConnected/OnDisconnected/OnRawMessage
+	// (event hooks fired from network goroutines) — both write JSON+newline frames
+	// to the same loopback conn and the bytes can interleave. The TUI's
+	// bufio.Scanner then reads a half-frame, fails to parse, and the read loop
+	// exits → the TUI is stuck on "searching" until restart. This is the bug
+	// where the agent is ready+connected but the student is not updated.
+	tuiWriteMu sync.Mutex
 )
+
+// writeToTUI is the only path that touches tuiConn for output. The lock is
+// held briefly across one WriteFrame call so concurrent producers can't tear
+// each other's frames.
+func writeToTUI(c net.Conn, f ipc.Frame) {
+	if c == nil {
+		return
+	}
+	tuiWriteMu.Lock()
+	defer tuiWriteMu.Unlock()
+	ipc.WriteFrame(c, f) //nolint:errcheck
+}
 
 func sendToTUI(f ipc.Frame) {
 	tuiMu.Lock()
 	c := tuiConn
 	tuiMu.Unlock()
-	if c != nil {
-		ipc.WriteFrame(c, f) //nolint:errcheck
-	}
+	writeToTUI(c, f)
 }
 
 func main() {
@@ -121,17 +140,25 @@ func main() {
 }
 
 // replayHistoryToTUI sends all stored messages and current class state to a
-// freshly-connected TUI, so it starts with the full picture.
+// freshly-connected TUI, so it starts with the full picture. All writes go
+// through writeToTUI so they cannot interleave with concurrent event-hook
+// writes (OnConnected, OnRawMessage, OnDisconnected) from network goroutines.
+//
+// We also re-check IsConnected() at the END and, if it flipped to true while
+// we were replaying, send a fresh TypeConnected. This closes a TOCTOU window
+// where the agent finished its TCP connect during the replay — without this,
+// the TUI would have to wait for the next disconnect/reconnect to learn it's
+// online (or be restarted).
 func replayHistoryToTUI(app *core.App, conn net.Conn) {
 	app.Mu().RLock()
 	msgs := make([]core.ChatMessage, len(app.Messages))
 	copy(msgs, app.Messages)
 	state := app.State
-	connected := app.Client != nil && app.Client.IsConnected()
+	connectedAtStart := app.Client != nil && app.Client.IsConnected()
 	app.Mu().RUnlock()
 
-	if connected {
-		ipc.WriteFrame(conn, ipc.Frame{Type: ipc.TypeConnected}) //nolint:errcheck
+	if connectedAtStart {
+		writeToTUI(conn, ipc.Frame{Type: ipc.TypeConnected})
 	}
 
 	// Replay chat history
@@ -150,7 +177,7 @@ func replayHistoryToTUI(app *core.App, conn net.Conn) {
 			continue
 		}
 		raw, _ := json.Marshal(msg)
-		ipc.WriteFrame(conn, ipc.Frame{Type: ipc.TypeForward, Data: raw}) //nolint:errcheck
+		writeToTUI(conn, ipc.Frame{Type: ipc.TypeForward, Data: raw})
 	}
 
 	// Replay current class state (blocked input, monitoring banner, etc.)
@@ -164,7 +191,15 @@ func replayHistoryToTUI(app *core.App, conn net.Conn) {
 	})
 	if err == nil {
 		raw, _ := json.Marshal(stateMsg)
-		ipc.WriteFrame(conn, ipc.Frame{Type: ipc.TypeForward, Data: raw}) //nolint:errcheck
+		writeToTUI(conn, ipc.Frame{Type: ipc.TypeForward, Data: raw})
+	}
+
+	// Re-check connection state. If we missed a transition during replay
+	// (agent finished its TCP connect just now), re-emit TypeConnected so the
+	// TUI leaves the "searching" screen. Idempotent on the TUI side.
+	if !connectedAtStart && app.Client != nil && app.Client.IsConnected() {
+		writeToTUI(conn, ipc.Frame{Type: ipc.TypeConnected})
+		devlog.Logf("replay: late TypeConnected (transition during replay)")
 	}
 }
 
