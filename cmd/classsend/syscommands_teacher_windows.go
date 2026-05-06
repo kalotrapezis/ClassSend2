@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"classsend/internal/devlog"
 	"classsend/internal/network"
 )
 
@@ -159,18 +159,18 @@ func findFFmpegExe() string {
 func runCastCapture(srv *network.CastServer, stop <-chan struct{}) {
 	ffmpegPath := findFFmpegExe()
 	if ffmpegPath == "" {
-		log.Printf("cast: ffmpeg.exe not found beside classsend.exe or on PATH; cast disabled")
+		devlog.Logf("cast: ffmpeg.exe not found beside classsend.exe or on PATH; cast disabled")
 		<-stop
 		return
 	}
 
 	w, h := screenSize()
 	if w == 0 || h == 0 {
-		log.Printf("cast: GetSystemMetrics returned 0×0, cast disabled")
+		devlog.Logf("cast: GetSystemMetrics returned 0×0, cast disabled")
 		<-stop
 		return
 	}
-	log.Printf("cast: starting %dx%d @ %d fps via %s", w, h, castFPS, ffmpegPath)
+	devlog.Logf("cast: starting %dx%d @ %d fps via %s", w, h, castFPS, ffmpegPath)
 
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
@@ -203,29 +203,29 @@ func runCastCapture(srv *network.CastServer, stop <-chan struct{}) {
 	cmd := exec.Command(ffmpegPath, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		log.Printf("cast: stdin pipe: %v", err)
+		devlog.Logf("cast: stdin pipe: %v", err)
 		<-stop
 		return
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("cast: stdout pipe: %v", err)
+		devlog.Logf("cast: stdout pipe: %v", err)
 		<-stop
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		log.Printf("cast: stderr pipe: %v", err)
+		devlog.Logf("cast: stderr pipe: %v", err)
 		<-stop
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("cast: ffmpeg start: %v", err)
+		devlog.Logf("cast: ffmpeg start: %v", err)
 		<-stop
 		return
 	}
-	log.Printf("cast: ffmpeg pid=%d started", cmd.Process.Pid)
+	devlog.Logf("cast: ffmpeg pid=%d started", cmd.Process.Pid)
 
 	// Goroutine 1: drain stderr to log so a chatty ffmpeg can't deadlock by
 	// filling its stderr pipe.
@@ -245,13 +245,13 @@ func runCastCapture(srv *network.CastServer, stop <-chan struct{}) {
 			chunk, err := sp.NextChunk()
 			if err != nil {
 				if err != io.EOF {
-					log.Printf("cast: fMP4 parser: %v", err)
+					devlog.Logf("cast: fMP4 parser: %v", err)
 				}
 				return
 			}
 			bytesOut.Add(int64(len(chunk.Data)))
 			if chunk.Init {
-				log.Printf("cast: init segment %d bytes ready", len(chunk.Data))
+				devlog.Logf("cast: init segment %d bytes ready", len(chunk.Data))
 				srv.SendFrame(chunk.Data, network.FrameInit)
 				continue
 			}
@@ -279,7 +279,7 @@ func runCastCapture(srv *network.CastServer, stop <-chan struct{}) {
 				f := framesEncoded.Load()
 				b := bytesOut.Load()
 				sent, drops := srv.DrainStats()
-				log.Printf("cast: stats Δframes=%d Δbytes=%d sent=%d dropped=%d clients=%d",
+				devlog.Logf("cast: stats Δframes=%d Δbytes=%d sent=%d dropped=%d clients=%d",
 					f-lastFrames, b-lastBytes, sent, drops, srv.ClientCount())
 				lastFrames = f
 				lastBytes = b
@@ -310,7 +310,7 @@ captureLoop:
 		// the capture loop, which is the right behavior — dropping input
 		// frames would just cause the encoder to encode duplicates.
 		if _, err := stdin.Write(buf); err != nil {
-			log.Printf("cast: stdin write: %v (ffmpeg likely exited)", err)
+			devlog.Logf("cast: stdin write: %v (ffmpeg likely exited)", err)
 			break captureLoop
 		}
 	}
@@ -325,16 +325,16 @@ captureLoop:
 	select {
 	case <-parserDone:
 	case <-time.After(3 * time.Second):
-		log.Printf("cast: parser did not drain in 3s, forcing kill")
+		devlog.Logf("cast: parser did not drain in 3s, forcing kill")
 	}
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- cmd.Wait() }()
 	select {
 	case err := <-waitDone:
-		log.Printf("cast: ffmpeg exited: %v", err)
+		devlog.Logf("cast: ffmpeg exited: %v", err)
 	case <-time.After(2 * time.Second):
-		log.Printf("cast: ffmpeg did not exit in 2s, killing pid=%d", cmd.Process.Pid)
+		devlog.Logf("cast: ffmpeg did not exit in 2s, killing pid=%d", cmd.Process.Pid)
 		_ = cmd.Process.Kill()
 		<-waitDone
 	}
@@ -350,7 +350,7 @@ func drainFFmpegStderr(r io.Reader) {
 		if line != "" {
 			line = strings.TrimRight(line, "\r\n")
 			if line != "" {
-				log.Printf("cast: ffmpeg stderr: %s", line)
+				devlog.Logf("cast: ffmpeg stderr: %s", line)
 			}
 		}
 		if err != nil {
