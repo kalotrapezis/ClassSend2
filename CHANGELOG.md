@@ -71,7 +71,9 @@ Classroom-UX release. Driven entirely by feedback from a real lesson: monitoring
 
 ### Compatibility
 
-- **No wire-format change.** v0.0.7 students work identically with v0.0.8 teachers and vice versa — all changes are teacher-side state machine and TUI.
+- **No wire-format change.** v0.0.7 ↔ v0.0.8 mixed deployments still talk to each other — chat, monitoring requests, push-open, lock/mute, casting all keep working across the version skew.
+- **The BitBlt fix is student-side, not teacher-side.** `captureScreen` runs inside `classsend-agent.exe` on each student PC, so a Win10 student showing black thumbnails will keep showing black thumbnails until that student's agent is updated to v0.0.8. Updating only the teacher PC will not fix the symptom — re-run `ClassSend2-Setup-v0.0.8.exe` on every Win10 student to roll out the fix.
+- All other changes (Path Notes, attach→push shortcuts, hostname sort, overlay rebindings, --about window, monitoring nudge) are teacher-side state machine and TUI; teacher-only upgrade is enough for those.
 - Cast pipeline unchanged from v0.0.7 (still bundled ffmpeg → fMP4/H.264).
 
 ---
