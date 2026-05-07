@@ -2,7 +2,7 @@
 ; Default version — overridable via ISCC /DMyAppVersion=... so build-release.bat
 ; can ship a clean version string without editing this file.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.7"
+  #define MyAppVersion "0.0.8"
 #endif
 #define MyAppPublisher "ClassSend"
 

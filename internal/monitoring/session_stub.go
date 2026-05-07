@@ -7,9 +7,10 @@ import "fmt"
 // StartSession is a no-op on non-Windows platforms.
 func StartSession(
 	getStudents func() []StudentInfo,
-	sendCmd func(studentID string) error,
+	sendCmd func(studentID, param string) error,
 	shotCh <-chan ShotMsg,
 	exePath string,
-) (stop func(), err error) {
-	return nil, fmt.Errorf("monitoring is only supported on Windows")
+	onEnded func(),
+) (stop func(), nudge func(), err error) {
+	return nil, nil, fmt.Errorf("monitoring is only supported on Windows")
 }

@@ -257,7 +257,7 @@ func StartSession(
 	shotCh <-chan ShotMsg,
 	exePath string,
 	onEnded func(), // called once when the session goroutine exits (window closed, pipe broke, or stop called)
-) (stop func(), err error) {
+) (stop func(), nudge func(), err error) {
 	// Create the duplex named pipe in OVERLAPPED mode. Out buffer 1 MB so a
 	// big screenshot never fills it; in buffer 4 KB for focus messages.
 	namePtr, _ := syscall.UTF16PtrFromString(PipeName)
@@ -272,7 +272,7 @@ func StartSession(
 		0,     // security attrs
 	)
 	if pipe == invalidHandle {
-		return nil, fmt.Errorf("CreateNamedPipe: %w", e)
+		return nil, nil, fmt.Errorf("CreateNamedPipe: %w", e)
 	}
 
 	// Launch monitoring.exe before blocking on ConnectNamedPipe.
@@ -292,7 +292,7 @@ func StartSession(
 	devlog.Logf("monitoring: spawning %s", exePath)
 	if startErr := cmd.Start(); startErr != nil {
 		procCloseHandle.Call(pipe)
-		return nil, fmt.Errorf("launch monitoring.exe: %w", startErr)
+		return nil, nil, fmt.Errorf("launch monitoring.exe: %w", startErr)
 	}
 
 	// ConnectNamedPipe in overlapped mode: it ALWAYS returns 0; check
@@ -302,7 +302,7 @@ func StartSession(
 	if err != nil {
 		procCloseHandle.Call(pipe)
 		cmd.Process.Kill() //nolint:errcheck
-		return nil, err
+		return nil, nil, err
 	}
 	connOp.reset()
 	cRet, _, cErr := procConnectNamedPipe.Call(pipe, uintptr(unsafe.Pointer(&connOp.ov)))
@@ -310,7 +310,7 @@ func StartSession(
 		connOp.close()
 		procCloseHandle.Call(pipe)
 		cmd.Process.Kill() //nolint:errcheck
-		return nil, fmt.Errorf("ConnectNamedPipe: %w", cErr)
+		return nil, nil, fmt.Errorf("ConnectNamedPipe: %w", cErr)
 	}
 	if cRet == 0 && cErr == syscall.Errno(errorIoPending) {
 		wRet, _, _ := procWaitForSingleObject.Call(connOp.event, 12000)
@@ -321,7 +321,7 @@ func StartSession(
 			procCloseHandle.Call(pipe)
 			cmd.Process.Kill() //nolint:errcheck
 			devlog.Logf("monitoring: pipe connect TIMEOUT after 12s")
-			return nil, fmt.Errorf("monitoring.exe did not connect within 12 s")
+			return nil, nil, fmt.Errorf("monitoring.exe did not connect within 12 s")
 		}
 	}
 	connOp.close()
@@ -334,7 +334,7 @@ func StartSession(
 	if err != nil {
 		procCloseHandle.Call(pipe)
 		cmd.Process.Kill() //nolint:errcheck
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Send initial student list
@@ -344,10 +344,18 @@ func StartSession(
 		writeOp.close()
 		procCloseHandle.Call(pipe)
 		cmd.Process.Kill() //nolint:errcheck
-		return nil, fmt.Errorf("send init: %w", initErr)
+		return nil, nil, fmt.Errorf("send init: %w", initErr)
 	}
 
 	stopCh := make(chan struct{})
+
+	// wakeCh is signalled by the nudge() func returned to the caller. The
+	// polling loop uses it to short-circuit its inter-round sleep so a
+	// newly-joined student appears in the grid promptly instead of waiting
+	// up to ~2 s + (rest of round). Buffered=1 so a nudge fired while the
+	// loop is mid-round doesn't block the caller; a single buffered tick is
+	// enough since the loop coalesces multiple joins on its next pass.
+	wakeCh := make(chan struct{}, 1)
 
 	// focusIdx is updated by the back-channel reader goroutine when
 	// monitoring.exe sends MsgFocus. The polling loop reads it on every
@@ -410,6 +418,7 @@ func StartSession(
 				// Tighter loop in focus mode — ~1 fps for live-ish feel
 				select {
 				case <-time.After(800 * time.Millisecond):
+				case <-wakeCh:
 				case <-stopCh:
 					return
 				}
@@ -462,19 +471,27 @@ func StartSession(
 			// Pause between full rounds
 			select {
 			case <-time.After(2 * time.Second):
+			case <-wakeCh:
 			case <-stopCh:
 				return
 			}
 		}
 	}()
 
-	return func() {
+	stop = func() {
 		select {
 		case <-stopCh: // already stopped
 		default:
 			close(stopCh)
 		}
-	}, nil
+	}
+	nudge = func() {
+		select {
+		case wakeCh <- struct{}{}:
+		default: // buffer full — a wake is already pending, no need for another
+		}
+	}
+	return stop, nudge, nil
 }
 
 // readPipeBackChannel reads MsgFocus messages sent by monitoring.exe and

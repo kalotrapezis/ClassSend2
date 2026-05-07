@@ -96,6 +96,12 @@ type App struct {
 	Blacklist []string
 	Whitelist []string
 
+	// Favorites — recent push-open URLs / attached file paths (teacher only).
+	// Populated automatically by PushOpenURL and SendFile so the teacher can
+	// re-launch the same target without retyping the path. UI lives in the
+	// favorites overlay (^F). Persisted to favorites.json.
+	Favorites []FavoriteEntry
+
 	// Class state (teacher tracks authoritative state; student mirrors it)
 	State    ClassState
 	Messages []ChatMessage
@@ -166,6 +172,7 @@ func NewApp(role Role, dataDir string, devMode bool) (*App, error) {
 func (a *App) StartTeacher() error {
 	a.loadMessages()
 	a.loadLists()
+	a.loadFavorites()
 
 	srv := network.NewServer()
 
@@ -1304,8 +1311,11 @@ func (a *App) loadMessages() {
 
 // SendFile reads path, attaches it to a new chat message, and streams chunks to
 // all students (teacher) or to the teacher (student).  caption is the message
-// text; pass "" to default to the filename.
-func (a *App) SendFile(path, caption, targetStudentID string) error {
+// text; pass "" to default to the filename. When autoOpen is true (teacher only),
+// the file header carries AutoOpen=true so receiving students open the file
+// immediately instead of just storing it — equivalent to a SendFile + PushOpenFile
+// in one step, with no double-transfer.
+func (a *App) SendFile(path, caption, targetStudentID string, autoOpen bool) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
@@ -1322,6 +1332,11 @@ func (a *App) SendFile(path, caption, targetStudentID string) error {
 
 	if err := a.storeFile(fileID, name, data); err != nil {
 		return fmt.Errorf("store file: %w", err)
+	}
+	if a.Role == RoleTeacher {
+		if abs, err := filepath.Abs(path); err == nil {
+			a.AddFavorite(abs)
+		}
 	}
 
 	cm := ChatMessage{
@@ -1351,7 +1366,7 @@ func (a *App) SendFile(path, caption, targetStudentID string) error {
 			} else {
 				a.Server.Send(targetStudentID, chatMsg)
 			}
-			a.sendChunksServer(fileID, name, size, data, targetStudentID, false)
+			a.sendChunksServer(fileID, name, size, data, targetStudentID, autoOpen)
 		} else {
 			a.Client.Send(chatMsg)
 			a.sendChunksClient(fileID, name, size, data)
@@ -1540,8 +1555,11 @@ func (a *App) PushOpenURL(url, targetStudentID string) error {
 	if targetStudentID == "" {
 		a.Server.Broadcast(msg)
 	} else {
-		return a.Server.Send(targetStudentID, msg)
+		if err := a.Server.Send(targetStudentID, msg); err != nil {
+			return err
+		}
 	}
+	a.AddFavorite(url)
 	return nil
 }
 
