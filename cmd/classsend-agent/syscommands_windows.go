@@ -109,6 +109,7 @@ const (
 	smCxScreen   = 0
 	smCyScreen   = 1
 	srcCopy      = 0x00CC0020
+	captureBlt   = 0x40000000 // include layered/DWM-composited windows; without this Win10 BitBlt can return black for hardware-accelerated content
 	dibRgbColors = 0
 	biRgb        = 0
 
@@ -292,7 +293,7 @@ func captureScreenSized(maxEdge int, quality int) ([]byte, error) {
 	defer procDeleteObject.Call(hBmp)
 
 	procSelectObject.Call(hdcMem, hBmp)
-	procBitBlt.Call(hdcMem, 0, 0, w, h, hdcScreen, 0, 0, srcCopy)
+	procBitBlt.Call(hdcMem, 0, 0, w, h, hdcScreen, 0, 0, srcCopy|captureBlt)
 
 	bi := bitmapInfoHeader{
 		biSize:        40,

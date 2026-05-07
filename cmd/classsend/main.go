@@ -119,8 +119,9 @@ func wireMonitoring(app *core.App) {
 	}
 
 	var (
-		sessionMu   sync.Mutex
-		sessionStop func()
+		sessionMu    sync.Mutex
+		sessionStop  func()
+		sessionNudge func()
 	)
 
 	app.OnMonitoringStart = func() {
@@ -159,11 +160,12 @@ func wireMonitoring(app *core.App) {
 			devlog.Logf("monitoring: session ended, clearing state")
 			sessionMu.Lock()
 			sessionStop = nil
+			sessionNudge = nil
 			sessionMu.Unlock()
 			app.MarkMonitoringEnded()
 		}
 
-		stop, err := monitoring.StartSession(getStudents, sendCmd, shotCh, exePath, onEnded)
+		stop, nudge, err := monitoring.StartSession(getStudents, sendCmd, shotCh, exePath, onEnded)
 		if err != nil {
 			devlog.Logf("monitoring: StartSession FAILED: %v", err)
 			log.Printf("monitoring: %v", err)
@@ -171,6 +173,7 @@ func wireMonitoring(app *core.App) {
 		}
 		devlog.Logf("monitoring: StartSession ok")
 		sessionStop = stop
+		sessionNudge = nudge
 	}
 
 	app.OnMonitoringStop = func() {
@@ -180,6 +183,25 @@ func wireMonitoring(app *core.App) {
 		if sessionStop != nil {
 			sessionStop()
 			sessionStop = nil
+			sessionNudge = nil
+		}
+	}
+
+	// Late-joining students: nudge the monitoring session so it re-INITs
+	// the grid immediately instead of waiting up to ~2 s for the next round.
+	// Wraps the existing OnStudentJoin set in main(); we capture the prior
+	// hook so the TUI sidebar update still fires.
+	prevJoin := app.OnStudentJoin
+	app.OnStudentJoin = func(st *network.Student) {
+		if prevJoin != nil {
+			prevJoin(st)
+		}
+		sessionMu.Lock()
+		nudge := sessionNudge
+		sessionMu.Unlock()
+		if nudge != nil {
+			devlog.Logf("monitoring: nudging session for late-join  student=%s", st.Hostname)
+			nudge()
 		}
 	}
 }

@@ -14,6 +14,68 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.0.8] — 2026-05-07
+
+Classroom-UX release. Driven entirely by feedback from a real lesson: monitoring lost late-joining students, Win10 PCs showed black thumbnails, and `--op` was a two-step typing dance. Three bug fixes plus a set of keyboard-first conveniences (Path Notes, attach→push in two keystrokes, hostname-aware sidebar sort, every overlay's title now spells out its shortcut letter).
+
+### Fixed
+
+- **Monitoring grid no longer freezes on the initial student set** ([internal/monitoring/session_windows.go](internal/monitoring/session_windows.go)). `StartSession` now also returns a `nudge func()`; the polling loop's inter-round and focus-mode sleeps `select` on a `wakeCh` so a join can short-circuit them. `cmd/classsend/main.go` chains a wrapper around `app.OnStudentJoin` that fires the nudge whenever a student joins during an active session — the next round picks up the new student via `studentsChanged`, sends a fresh `MsgInit`, and the WebView grid re-renders preserving existing thumbnails by name. Previously you had to close and re-open monitoring to see anyone who connected after `tvon`.
+- **Win10 BitBlt black thumbnails** ([cmd/classsend-agent/syscommands_windows.go:295](cmd/classsend-agent/syscommands_windows.go:295)). Added `CAPTUREBLT` (0x40000000) to the BitBlt raster op (now `srcCopy | captureBlt`). Without it, BitBlt of the desktop DC returns black for DWM-composited / hardware-accelerated content on Win10 even though Win11 typically returns the correct frame. Visible symptom in production: every Win10 cell black, the single Win11 cell showing real content.
+
+### Added
+
+#### Path Notes — saved push-open targets
+
+- New persistent list of recent URLs and attached file paths ([internal/core/favorites.go](internal/core/favorites.go)). Stored in `%APPDATA%\ClassSend\favorites.json`, capped at 50 entries (newest-first), duplicates move-to-front. Survives across sessions.
+- Auto-populated by every `PushOpenURL` call and every teacher-side `SendFile` (the absolute path of the attached file gets recorded). No manual "add" step needed.
+- **^N** opens the Path Notes overlay. Enter places the highlighted entry into the input as `--op "<value>" >` (incomplete on purpose — the teacher appends `*` or a student number; explicit beats accidental broadcast). `d` / Delete removes the entry without closing the panel.
+- Smart truncation when an entry is too wide for the overlay: URLs (`http://`, `https://`, `www.`, `ftp://`) keep their **head** so the protocol + domain stay readable; everything else is treated as a file path and keeps the **tail** so the filename / app name stays visible.
+- New `--path` command family for manual control:
+  - `--pa` / `--path` / `--path open` — open the overlay
+  - `--path save <url-or-path>` — save manually; floats to top because `AddedAt = now`
+  - `--path delete <exact-value>` — remove
+  - `--path remove <value>` — alias for delete
+
+#### Attach + push-open in one action
+
+- **^A → ^O** flow ([internal/tui/model.go:511](internal/tui/model.go:511)): pick a file via the file picker, then ^O sends it to all students with `AutoOpen=true` in the file header — no typing. Equivalent to typing `--op this > *` after attaching.
+- New `--op this > *` / `--op this > N` / `--op > *` / `--op > N` syntax recognised when a file is staged. Sends in one wire transfer with `AutoOpen=true` rather than the old two-step (SendFile + PushOpenFile) which uploaded the file twice.
+- `App.SendFile` gains an `autoOpen bool` parameter; chunks are flagged at the header so receiving students open immediately on receipt.
+
+#### Hostname-aware sidebar sort
+
+- The student list now sorts by trailing-digit semantics: `Lab1, Lab2, Lab10` (not the lexicographic `Lab1, Lab10, Lab2`). Same prefix groups numerically; cross-prefix groups alphabetically. So `>1` always points at physically-first PC once you've named hostnames `Lab1..Lab12` or `PC1..PC12`.
+- `hostnameLess` + `splitHostNum` helpers in [internal/tui/model.go](internal/tui/model.go), regression-tested in [internal/tui/sort_test.go](internal/tui/sort_test.go). Selection follows the sort by ID, not by index — your highlight stays on the same PC across re-orderings.
+
+#### New keyboard shortcuts (teacher only)
+
+- **^W** — toggle classroom monitoring (tvon/tvoff). Repurposed from the old "focus input" binding.
+- **^L** — toggle screen-lock on every student.
+- **^Z** — toggle mute on every student.
+- **^F** — primes a focus-window command (`--t focus ` ready to type the title). The blacklist/whitelist overlay (was ^L) now lives on **^G** — "Content (G)ate".
+- All four toggles read `m.state` so they stay in sync with the authoritative class state, even if you change it via `--t lock` from the command line.
+
+#### `--about` is now a window
+
+- Was: dump 20+ lines into the chat area, push everything older off-screen.
+- Is: a centered, bordered, scrollable overlay matching the `--help` style. Built from `buildinfo` (live build string + role + log path) plus `about.md` read at runtime — `about.md` can still be edited post-install without rebuild.
+- [about.md](about.md) rewritten with three contact lines at the top (kalotrapezis@gmail.com, https://github.com/kalotrapezis/ClassSend2, https://blogs.sch.gr/goodtable/), the rest trimmed to fit the overlay.
+
+### Changed
+
+- **Every overlay title spells out its shortcut letter** in parens. `(H)elp / Βοήθεια`, `(T)ools — Εργαλεία`, `File (A)ttachment`, `Content (G)ate — Λίστες`, `Path (N)otes`. Discoverable without reading help.
+- Help text reorganised: ^W / ^L / ^Z / ^G / ^N / ^F all listed under teacher shortcuts; `--path` family documented in its own block under PUSH-OPEN.
+- `monitoring.StartSession` signature changed: returns `(stop, nudge func(), err error)` instead of `(stop, err)`. Single caller updated; non-Windows stub matches.
+- `App.SendFile` signature changed: gains a final `autoOpen bool` parameter.
+
+### Compatibility
+
+- **No wire-format change.** v0.0.7 students work identically with v0.0.8 teachers and vice versa — all changes are teacher-side state machine and TUI.
+- Cast pipeline unchanged from v0.0.7 (still bundled ffmpeg → fMP4/H.264).
+
+---
+
 ## [0.0.7] — 2026-05-06
 
 Cast is now self-contained: a fresh teacher install can broadcast immediately, no separate ffmpeg installation required. Cost is installer size — 18 MB → 60 MB — but the teacher PC already has plenty of disk to spare and IT admins no longer need a second `winget install` step.

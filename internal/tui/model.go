@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +65,13 @@ type Model struct {
 
 	helpOpen   bool
 	helpScroll int
+
+	aboutOpen   bool
+	aboutScroll int
+
+	favoritesOpen   bool
+	favoritesCursor int
+	favoritesScroll int
 
 	listOpen   bool
 	listScroll int
@@ -227,6 +235,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	toolsWereOpen     := m.toolsOpen      // capture before key handling closes the panel
 	filePickerWasOpen := m.filePickerOpen // same guard for file picker
 	helpWasOpen       := m.helpOpen       // same guard for help overlay
+	aboutWasOpen      := m.aboutOpen      // same guard for about overlay
+	favoritesWasOpen  := m.favoritesOpen  // same guard for favorites overlay
 	listWasOpen       := m.listOpen       // same guard for list overlay
 
 	switch msg := msg.(type) {
@@ -327,7 +337,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Forward remaining key events to input only when focused and no overlay is open.
 	// Enter is never forwarded — it's the send key, not a newline, and would leave a
 	// blank line in the textarea after Reset() clears the value.
-	noOverlay := !m.toolsOpen && !toolsWereOpen && !m.filePickerOpen && !filePickerWasOpen && !m.helpOpen && !helpWasOpen && !m.listOpen && !listWasOpen
+	noOverlay := !m.toolsOpen && !toolsWereOpen && !m.filePickerOpen && !filePickerWasOpen && !m.helpOpen && !helpWasOpen && !m.aboutOpen && !aboutWasOpen && !m.favoritesOpen && !favoritesWasOpen && !m.listOpen && !listWasOpen
 	isEnter := func() bool {
 		k, ok := msg.(tea.KeyMsg)
 		if !ok {
@@ -396,7 +406,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case "ctrl+w":
-		if m.screen == screenChat {
+		// ^W toggles classroom monitoring (tvon/tvoff). Teacher-only — on
+		// students this key is unbound. Repurposed from the previous
+		// "focus input" binding (input is already focused most of the time;
+		// the monitoring toggle is much more frequently useful).
+		if m.screen == screenChat && m.app.Role == core.RoleTeacher {
+			if m.state.Monitoring {
+				return m.handleToolCmd("tvoff")
+			}
+			return m.handleToolCmd("tvon")
+		}
+
+	case "ctrl+f":
+		// ^F primes a focus-window command. Teacher fills in the window title
+		// after the prefix, e.g. "--t focus Chrome", and the agent calls
+		// SetForegroundWindow on the matched window. Pre-staging the prefix
+		// keeps the syntax discoverable without a separate prompt.
+		if m.screen == screenChat && m.app.Role == core.RoleTeacher {
+			m.input.SetValue("--t focus ")
 			m.focusInput = true
 			return m.input.Focus()
 		}
@@ -409,9 +436,31 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case "ctrl+l":
+		// ^L toggles the screen-lock state on every student. Repurposed from
+		// the old list overlay (now on ^G). Reads m.state.ScreenLocked which
+		// the teacher mirrors authoritatively, so the toggle stays correct
+		// even if the state was changed via --t lock from the command line.
+		if m.screen == screenChat && m.app.Role == core.RoleTeacher {
+			if m.state.ScreenLocked {
+				return m.handleToolCmd("unlock")
+			}
+			return m.handleToolCmd("lock")
+		}
+
+	case "ctrl+g":
+		// ^G — blacklist/whitelist overlay (formerly ^L).
 		if m.screen == screenChat && m.app.Role == core.RoleTeacher {
 			m.listOpen = !m.listOpen
 			m.listScroll = 0
+		}
+
+	case "ctrl+z":
+		// ^Z toggles class-wide mute. Mirror of ^L for sound.
+		if m.screen == screenChat && m.app.Role == core.RoleTeacher {
+			if m.state.Muted {
+				return m.handleToolCmd("unmute")
+			}
+			return m.handleToolCmd("mute")
 		}
 
 	case "ctrl+s":
@@ -426,6 +475,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		if m.helpOpen {
 			m.helpOpen = false
+			return nil
+		}
+		if m.aboutOpen {
+			m.aboutOpen = false
+			return nil
+		}
+		if m.favoritesOpen {
+			m.favoritesPlaceSelected()
 			return nil
 		}
 		if m.filePickerOpen {
@@ -460,6 +517,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return m.doPinLast()
 		}
 
+	case "ctrl+n":
+		// ^N opens Path Notes — saved URLs / file paths the teacher has
+		// push-opened or attached. Teacher only.
+		if m.app.Role == core.RoleTeacher && m.screen == screenChat {
+			m.favoritesOpen = !m.favoritesOpen
+			m.favoritesCursor = 0
+			m.favoritesScroll = 0
+		}
+
 	case "ctrl+b":
 		if m.app.Role == core.RoleTeacher && m.screen == screenChat {
 			return m.shortcutAction("black")
@@ -467,6 +533,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	case "ctrl+o":
 		if m.screen == screenChat {
+			// Teacher: if a file is staged (just attached via ^A), ^O fires
+			// the keyboard equivalent of "--op this > *" — sends to all with
+			// auto-open in one stroke. Lets the user do attach→push without
+			// touching the textarea. Falls through to the existing pass-by-
+			// reference shortcut if nothing is staged.
+			if m.app.Role == core.RoleTeacher && m.stagedFile != "" {
+				staged := m.stagedFile
+				m.stagedFile = ""
+				if err := m.app.SendFile(staged, "", "", true); err != nil {
+					m.pushSysMsg("⚠ " + err.Error())
+				} else {
+					m.pushSysMsg(fmt.Sprintf("📤→📂 %s → όλους", filepath.Base(staged)))
+				}
+				return nil
+			}
 			if m.app.Role == core.RoleTeacher {
 				return m.shortcutAction("pass")
 			}
@@ -478,6 +559,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.listOpen = false
 		} else if m.helpOpen {
 			m.helpOpen = false
+		} else if m.aboutOpen {
+			m.aboutOpen = false
+		} else if m.favoritesOpen {
+			m.favoritesOpen = false
 		} else if m.filePickerOpen {
 			m.filePickerOpen = false
 		} else if m.stagedFile != "" {
@@ -500,6 +585,17 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		} else if m.helpOpen {
 			if m.helpScroll > 0 {
 				m.helpScroll--
+			}
+		} else if m.aboutOpen {
+			if m.aboutScroll > 0 {
+				m.aboutScroll--
+			}
+		} else if m.favoritesOpen {
+			if m.favoritesCursor > 0 {
+				m.favoritesCursor--
+				if m.favoritesCursor < m.favoritesScroll {
+					m.favoritesScroll = m.favoritesCursor
+				}
 			}
 		} else if m.filePickerOpen {
 			if m.filePickerCursor > 0 {
@@ -531,6 +627,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if m.helpScroll < len(lines)-maxVis {
 				m.helpScroll++
 			}
+		} else if m.aboutOpen {
+			lines := m.aboutLines()
+			const maxVis = 22
+			if m.aboutScroll < len(lines)-maxVis {
+				m.aboutScroll++
+			}
+		} else if m.favoritesOpen {
+			n := len(m.app.FavoritesSnapshot())
+			if m.favoritesCursor < n-1 {
+				m.favoritesCursor++
+				const maxVis = 18
+				if m.favoritesCursor >= m.favoritesScroll+maxVis {
+					m.favoritesScroll = m.favoritesCursor - maxVis + 1
+				}
+			}
 		} else if m.filePickerOpen {
 			if m.filePickerCursor < len(m.filePickerEntries) {
 				m.filePickerCursor++
@@ -549,17 +660,26 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case "k":
-		if !m.focusInput && !m.helpOpen && !m.filePickerOpen && !m.toolsOpen {
+		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.filePickerOpen && !m.toolsOpen {
 			if m.selectedSt > 0 {
 				m.selectedSt--
 			}
 		}
 
 	case "j":
-		if !m.focusInput && !m.helpOpen && !m.filePickerOpen && !m.toolsOpen {
+		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.filePickerOpen && !m.toolsOpen {
 			if m.selectedSt < len(m.students)-1 {
 				m.selectedSt++
 			}
+		}
+
+	case "d", "delete":
+		// Inside the favorites overlay, 'd' (or Delete) removes the highlighted
+		// entry. Outside the overlay this falls through to the input field as
+		// a normal letter, so tying chat won't trigger anything.
+		if m.favoritesOpen {
+			m.favoritesDeleteSelected()
+			return nil
 		}
 	}
 
@@ -749,6 +869,15 @@ func (m *Model) trySend() tea.Cmd {
 		return m.handleToolCmd("tvon")
 	}
 
+	// --pa / --path  Path Notes manager (teacher only).
+	//   --pa | --path | --path open      → open the ^N overlay
+	//   --path save  <url-or-path>       → save value, surfaces at top
+	//   --path delete <url-or-path>      → remove value
+	//   --path remove                    → alias for delete
+	if m.app.Role == core.RoleTeacher && isPathCmd(text) {
+		return m.handlePathCmd(text)
+	}
+
 	// --log  show the active session log path (or warn if logging is off)
 	if text == "--log" {
 		if p := devlog.Path(); p != "" {
@@ -769,16 +898,8 @@ func (m *Model) trySend() tea.Cmd {
 	// update the page after deployment without rebuilding. Falls back to a
 	// minimal one-liner if the file is missing.
 	if text == "--ver" || text == "--version" || text == "--about" {
-		m.pushSysMsg("ClassSend 2  •  " + buildinfo.String())
-		m.pushSysMsg("Ρόλος: " + string(m.app.Role) + "  •  Logs: " + devlog.Path())
-		if path, content, ok := readAboutFile(); ok {
-			m.pushSysMsg("── about.md (" + path + ") ──")
-			for _, line := range strings.Split(strings.TrimRight(content, "\r\n"), "\n") {
-				m.pushSysMsg(strings.TrimRight(line, "\r"))
-			}
-		} else {
-			m.pushSysMsg("(about.md δεν βρέθηκε δίπλα στο .exe)")
-		}
+		m.aboutOpen = true
+		m.aboutScroll = 0
 		return nil
 	}
 
@@ -909,13 +1030,37 @@ func (m *Model) trySend() tea.Cmd {
 		}
 	}
 
-	// If a file is staged, send it with the message text as caption
+	// If a file is staged, send it with the message text as caption.
+	// Special teacher syntax — combine attach + push-open in one action:
+	//   "--op this > *"   send file + auto-open on every student
+	//   "--op this > N"   send file + auto-open on student #N
+	//   "--op > *" / "--op > N" also accepted as a shorthand
 	if m.stagedFile != "" {
 		staged := m.stagedFile
+		caption := text
+
+		autoOpen := false
+		var targetID, targetLabel string
+		if m.app.Role == core.RoleTeacher {
+			if destStr, ok := parseStagedPushOpen(text); ok {
+				id, label, err := m.resolveStudentTarget(destStr)
+				if err != nil {
+					m.pushSysMsg("⚠ " + err.Error())
+					return nil
+				}
+				autoOpen = true
+				targetID, targetLabel = id, label
+				caption = "" // drop the --op directive from the caption — fall back to filename
+			}
+		}
+
 		m.stagedFile = ""
-		caption := text // may be empty — SendFile defaults to filename
-		if err := m.app.SendFile(staged, caption, ""); err != nil {
+		if err := m.app.SendFile(staged, caption, targetID, autoOpen); err != nil {
 			m.pushSysMsg("⚠ " + err.Error())
+			return nil
+		}
+		if autoOpen {
+			m.pushSysMsg(fmt.Sprintf("📤→📂 %s → %s", filepath.Base(staged), targetLabel))
 		} else {
 			m.pushSysMsg(fmt.Sprintf("📤 Αποστολή: %s", filepath.Base(staged)))
 		}
@@ -1105,7 +1250,6 @@ func (m *Model) helpLines() []string {
 		"  ΓΕΝΙΚΕΣ ΣΥΝΤΟΜΕΥΣΕΙΣ",
 		"  Enter        αποστολή μηνύματος",
 		"  ^H           βοήθεια (αυτό το παράθυρο)",
-		"  ^W           εστίαση πεδίου γραφής",
 		"  ^A           browser αρχείων (Esc κλείσιμο)",
 		"  ^D           λήψη αρχείου  (@X.Y ή @fN στο πεδίο)",
 		"  ↑/↓          ιστορικό εντολών (bash-style)",
@@ -1116,9 +1260,15 @@ func (m *Model) helpLines() []string {
 		"  ΣΥΝΤΟΜΕΥΣΕΙΣ ΔΑΣΚΑΛΟΥ",
 		"  ^U    εμφάνιση/απόκρυψη λίστας μαθητών",
 		"  ^T    μενού εργαλείων          (^X κλείσιμο)",
-		"  ^L    μαύρη/λευκή λίστα        (^X κλείσιμο)",
+		"  ^G    Content (G)ate — μαύρη/λευκή λίστα  (^X κλείσιμο)",
+		"  ^L    κλείδωμα/ξεκλείδωμα οθονών (εναλλαγή)",
+		"  ^Z    σίγαση/κατάργηση σίγασης  (εναλλαγή)",
+		"  ^W    παρακολούθηση on/off (tvon/tvoff)",
 		"  ^S    casting on/off  (εναλλαγή)",
+		"  ^F    εστίαση παραθύρου σε μαθητή (πληκτρολόγησε τίτλο)",
+		"  ^N    Path (N)otes — αποθηκευμένα URL/αρχεία (^X κλείσιμο)",
 		"  ^P    καρφίτσωμα τελευταίου δικού σου μηνύματος",
+		"  ^A→^O αρχείο σε όλους + auto-open (μετά από ^A επιλογή)",
 		"  ^B    μαύρη λίστα             (@X.Y στο πεδίο)",
 		"  ^O    pass αναφοράς           (@X.Y στο πεδίο)",
 		"",
@@ -1172,6 +1322,12 @@ func (m *Model) helpLines() []string {
 		"  --op / --open @X.Y >N     push αρχείου/URL → μαθητής #N",
 		"  <url> --op                push URL σε όλους (shorthand)",
 		"  <url> --op >N             push URL σε μαθητή #N",
+		"  --op this >* | >N         (με 📎 staged) αποστολή + auto-open",
+		"",
+		"  PATH NOTES (δάσκαλος — ^N για το παράθυρο)",
+		"  --pa | --path | --path open       άνοιγμα Path Notes",
+		"  --path save   <url-ή-διαδρομή>    αποθήκευση (ανεβαίνει στην κορυφή)",
+		"  --path delete <ακριβής-τιμή>      αφαίρεση εγγραφής",
 		"",
 		"  ΕΡΓΑΛΕΙΑ  --t / --tool <εντολή> [>N] [param]  (Tab: κύκλος εντολών)",
 		"  lock / unlock          κλείδωμα/ξεκλείδωμα οθόνης",
@@ -1206,6 +1362,252 @@ func (m *Model) helpLines() []string {
 	}
 }
 
+// aboutLines is the body of the --about / --ver / --version overlay. The
+// running build string and live log path come from buildinfo / devlog so the
+// overlay always reflects the actual binary; the rest of the page is read
+// from about.md beside the .exe (so it can be edited post-install).
+func (m *Model) aboutLines() []string {
+	var lines []string
+	lines = append(lines, "ClassSend 2  •  "+buildinfo.String())
+	lines = append(lines, "Ρόλος: "+string(m.app.Role)+"  •  Logs: "+devlog.Path())
+	lines = append(lines, "")
+	if path, content, ok := readAboutFile(); ok {
+		lines = append(lines, "── about.md ("+path+") ──")
+		for _, line := range strings.Split(strings.TrimRight(content, "\r\n"), "\n") {
+			lines = append(lines, strings.TrimRight(line, "\r"))
+		}
+	} else {
+		lines = append(lines, "(about.md δεν βρέθηκε δίπλα στο .exe)")
+	}
+	return lines
+}
+
+func (m *Model) overlayAbout(base string) string {
+	const overlayW = 60
+	const maxVisible = 22
+
+	lines := m.aboutLines()
+	total := len(lines)
+
+	start := m.aboutScroll
+	if start > total-maxVisible {
+		start = total - maxVisible
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxVisible
+	if end > total {
+		end = total
+	}
+
+	var out []string
+	out = append(out, styleTitle.Render("  ClassSend 2.0 — Σχετικά"))
+	out = append(out, strings.Repeat("─", overlayW))
+	for _, l := range lines[start:end] {
+		out = append(out, lipgloss.NewStyle().Width(overlayW).Foreground(colText).Render(l))
+	}
+	out = append(out, strings.Repeat("─", overlayW))
+	if total > maxVisible {
+		pct := fmt.Sprintf("%d/%d", start+1, total)
+		out = append(out, styleHint.Render(fmt.Sprintf("[↑↓] Κύλιση  %s  [Esc/Enter] Κλείσιμο", pct)))
+	} else {
+		out = append(out, styleHint.Render("[Esc/Enter] Κλείσιμο"))
+	}
+
+	panel := styleBorder.Padding(1, 2).Render(strings.Join(out, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+		panel,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(colBg),
+	)
+}
+
+// truncateNote shortens a value to fit width w with the right tail visible:
+//
+//   - URLs (http://, https://, www., or "host.tld..." with no slash before TLD)
+//     keep their HEAD so the protocol + domain stay readable. The truncation
+//     mark is appended at the end.
+//   - Everything else is treated as a file path: the TAIL is kept so the
+//     filename / app name at the end stays readable. The truncation mark goes
+//     at the front.
+//
+// w must be >= 2 to make room for the ellipsis itself; callers pass overlay
+// width minus padding.
+func truncateNote(s string, w int) string {
+	if w < 2 {
+		w = 2
+	}
+	if len(s) <= w {
+		return s
+	}
+	low := strings.ToLower(s)
+	isURL := strings.HasPrefix(low, "http://") ||
+		strings.HasPrefix(low, "https://") ||
+		strings.HasPrefix(low, "www.") ||
+		strings.HasPrefix(low, "ftp://")
+	if isURL {
+		return s[:w-1] + "…"
+	}
+	return "…" + s[len(s)-(w-1):]
+}
+
+// overlayFavorites is the ^N panel: a scrollable list of saved push-open
+// targets (URLs and attached file paths). Enter places the highlighted entry
+// into the input field as `--op "<value>" >` (incomplete on purpose — the
+// teacher fills in `*` or a student number); 'd'/Delete removes the entry.
+func (m *Model) overlayFavorites(base string) string {
+	const overlayW = 70
+	const maxVisible = 18
+
+	favs := m.app.FavoritesSnapshot()
+
+	var out []string
+	out = append(out, styleTitle.Render("  📌 Path (N)otes — αποθηκευμένα URL/αρχεία"))
+	out = append(out, strings.Repeat("─", overlayW))
+
+	if len(favs) == 0 {
+		out = append(out, styleHint.Render("  (κενό — auto-add όταν στέλνεις αρχείο ή --op URL · ή --path save <τιμή>)"))
+	} else {
+		// Clamp cursor in case entries were just deleted
+		if m.favoritesCursor >= len(favs) {
+			m.favoritesCursor = len(favs) - 1
+		}
+		if m.favoritesCursor < 0 {
+			m.favoritesCursor = 0
+		}
+		start := m.favoritesScroll
+		if start > len(favs)-maxVisible {
+			start = len(favs) - maxVisible
+		}
+		if start < 0 {
+			start = 0
+		}
+		end := start + maxVisible
+		if end > len(favs) {
+			end = len(favs)
+		}
+		for i := start; i < end; i++ {
+			f := favs[i]
+			label := truncateNote(f.Value, overlayW-4)
+			line := "  " + label
+			if i == m.favoritesCursor {
+				line = styleSelected.Width(overlayW).Render(line)
+			} else {
+				line = lipgloss.NewStyle().Width(overlayW).Foreground(colText).Render(line)
+			}
+			out = append(out, line)
+		}
+	}
+
+	out = append(out, strings.Repeat("─", overlayW))
+	hint := "[↑↓] επιλογή  [Enter] τοποθέτηση στο πεδίο  [d] διαγραφή  [Esc] κλείσιμο"
+	out = append(out, styleHint.Render(hint))
+
+	panel := styleBorder.Padding(1, 2).Render(strings.Join(out, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+		panel,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(colBg),
+	)
+}
+
+// isPathCmd returns true if text is a --path / --pa form. Bare --pa also opens
+// the overlay; --path with a sub-verb routes to handlePathCmd.
+func isPathCmd(text string) bool {
+	if text == "--pa" || text == "--path" {
+		return true
+	}
+	return strings.HasPrefix(text, "--pa ") || strings.HasPrefix(text, "--path ")
+}
+
+// handlePathCmd dispatches the --path family. Recognised forms:
+//
+//	--pa  /  --path  /  --path open      open the Path Notes overlay (^N)
+//	--path save   <value>                save URL or absolute path; floats to top
+//	--path delete <value>                remove an exact match
+//	--path remove <value>                alias for delete
+//
+// Manual saves bump the entry's AddedAt to now, so they sort to the top above
+// any auto-tracked entries — the persistence layer already does move-to-front
+// for duplicates and survives across sessions via favorites.json.
+func (m *Model) handlePathCmd(text string) tea.Cmd {
+	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "--path"), "--pa"))
+	if body == "" || body == "open" {
+		m.favoritesOpen = true
+		m.favoritesCursor = 0
+		m.favoritesScroll = 0
+		return nil
+	}
+	parts := strings.SplitN(body, " ", 2)
+	verb := strings.ToLower(parts[0])
+	val := ""
+	if len(parts) == 2 {
+		val = strings.TrimSpace(parts[1])
+		val = strings.Trim(val, `"`)
+	}
+	switch verb {
+	case "save", "add":
+		if val == "" {
+			m.pushSysMsg("⚠ Χρήση: --path save <url-ή-διαδρομή>")
+			return nil
+		}
+		m.app.AddFavorite(val)
+		m.pushSysMsg("📌 Αποθηκεύτηκε στο Path Notes: " + val)
+	case "delete", "remove", "del", "rm":
+		if val == "" {
+			m.pushSysMsg("⚠ Χρήση: --path delete <ακριβής-τιμή>")
+			return nil
+		}
+		if m.app.RemoveFavorite(val) {
+			m.pushSysMsg("🗑 Αφαιρέθηκε από Path Notes: " + val)
+		} else {
+			m.pushSysMsg("⚠ Δεν βρέθηκε στο Path Notes: " + val)
+		}
+	default:
+		m.pushSysMsg("⚠ Άγνωστη εντολή: --path " + verb + "  (open/save/delete)")
+	}
+	return nil
+}
+
+// favoritesPlaceSelected inserts the highlighted favorite into the input as a
+// teacher push-open template. The trailing ">" is intentionally left bare so
+// the teacher types ">*" or ">3" before pressing Enter — explicit destination
+// avoids accidental broadcasts.
+func (m *Model) favoritesPlaceSelected() {
+	favs := m.app.FavoritesSnapshot()
+	if len(favs) == 0 || m.favoritesCursor < 0 || m.favoritesCursor >= len(favs) {
+		m.favoritesOpen = false
+		return
+	}
+	val := favs[m.favoritesCursor].Value
+	// Quote so paths with spaces survive the parser. URLs don't need quotes
+	// but quoting them is harmless — push-open accepts both.
+	m.input.SetValue(fmt.Sprintf(`--op "%s" >`, val))
+	m.favoritesOpen = false
+	m.focusInput = true
+}
+
+// favoritesDeleteSelected removes the highlighted entry from the persisted list.
+func (m *Model) favoritesDeleteSelected() {
+	favs := m.app.FavoritesSnapshot()
+	if len(favs) == 0 || m.favoritesCursor < 0 || m.favoritesCursor >= len(favs) {
+		return
+	}
+	val := favs[m.favoritesCursor].Value
+	if m.app.RemoveFavorite(val) {
+		m.pushSysMsg("⭐ Αφαιρέθηκε από αγαπημένα: " + val)
+	}
+	// Keep cursor in bounds; the list just got shorter.
+	remaining := len(favs) - 1
+	if m.favoritesCursor >= remaining {
+		m.favoritesCursor = remaining - 1
+	}
+	if m.favoritesCursor < 0 {
+		m.favoritesCursor = 0
+	}
+}
+
 func (m *Model) overlayHelp(base string) string {
 	const overlayW = 60
 	const maxVisible = 22
@@ -1226,7 +1628,7 @@ func (m *Model) overlayHelp(base string) string {
 	}
 
 	var out []string
-	out = append(out, styleTitle.Render("  ClassSend 2.0 — Βοήθεια"))
+	out = append(out, styleTitle.Render("  ClassSend 2.0 — (H)elp / Βοήθεια"))
 	out = append(out, strings.Repeat("─", overlayW))
 	for _, l := range lines[start:end] {
 		out = append(out, lipgloss.NewStyle().Width(overlayW).Foreground(colText).Render(l))
@@ -1373,6 +1775,12 @@ func (m *Model) viewChat() string {
 	}
 	if m.helpOpen {
 		view = m.overlayHelp(view)
+	}
+	if m.aboutOpen {
+		view = m.overlayAbout(view)
+	}
+	if m.favoritesOpen {
+		view = m.overlayFavorites(view)
 	}
 	if m.listOpen {
 		view = m.overlayList(view)
@@ -1579,7 +1987,7 @@ func (m *Model) renderMessages() string {
 
 func (m *Model) overlayTools(base string) string {
 	var lines []string
-	lines = append(lines, styleTitle.Render("⚙ Εργαλεία Δασκάλου"))
+	lines = append(lines, styleTitle.Render("⚙ (T)ools — Εργαλεία Δασκάλου"))
 	lines = append(lines, strings.Repeat("─", 34))
 
 	for i, t := range tools {
@@ -1698,7 +2106,7 @@ func (m *Model) overlayFilePicker(base string) string {
 	const maxVisible = 16
 
 	var lines []string
-	lines = append(lines, styleTitle.Render("📎 Επισύναψη Αρχείου"))
+	lines = append(lines, styleTitle.Render("📎 File (A)ttachment — Επισύναψη Αρχείου"))
 	lines = append(lines, strings.Repeat("─", w))
 
 	// Truncate dir path if too long
@@ -1783,10 +2191,76 @@ func (m *Model) upsertStudent(id, name, ip string, online bool) {
 			m.students[i].online = online
 			m.students[i].name = name
 			m.students[i].ip = ip
+			m.sortStudents()
 			return
 		}
 	}
 	m.students = append(m.students, studentEntry{id: id, name: name, ip: ip, online: online})
+	m.sortStudents()
+}
+
+// sortStudents re-orders the sidebar so hostnames with numeric suffixes
+// (Lab1, Lab02, PC3, …) line up by their number instead of by MAC. Tracks
+// the currently-selected student by ID so the highlight follows the row
+// across the sort. Same-prefix groups are numeric; cross-prefix groups
+// are alphabetical (so Lab* and PC* still cluster).
+func (m *Model) sortStudents() {
+	var selID string
+	if m.selectedSt >= 0 && m.selectedSt < len(m.students) {
+		selID = m.students[m.selectedSt].id
+	}
+	sort.SliceStable(m.students, func(i, j int) bool {
+		return hostnameLess(m.students[i].name, m.students[j].name)
+	})
+	m.selectedSt = 0
+	if selID != "" {
+		for i, st := range m.students {
+			if st.id == selID {
+				m.selectedSt = i
+				break
+			}
+		}
+	}
+}
+
+// hostnameLess compares two display names with awareness of a trailing
+// integer. "Lab2" < "Lab10" (numeric), but "Lab*" still groups before "PC*"
+// alphabetically. Names with no trailing digits sort lexicographically.
+func hostnameLess(a, b string) bool {
+	pa, na, hasA := splitHostNum(a)
+	pb, nb, hasB := splitHostNum(b)
+	if !strings.EqualFold(pa, pb) {
+		return strings.ToLower(pa) < strings.ToLower(pb)
+	}
+	if hasA && hasB {
+		return na < nb
+	}
+	if hasA != hasB {
+		// Within the same prefix, numeric entries come before non-numeric:
+		// "Lab1, Lab2, Lab" puts unnumbered names at the bottom of the group.
+		return hasA
+	}
+	return strings.ToLower(a) < strings.ToLower(b)
+}
+
+// splitHostNum walks back from the end of s collecting trailing digits. Empty
+// digit run → no numeric suffix. "Lab07" → ("Lab", 7, true);
+// "DESKTOP-RAHDSB6" → ("DESKTOP-RAHDSB", 6, true) — trailing-digit semantics
+// are intentional, so a MAC-derived hostname still groups with its prefix.
+func splitHostNum(s string) (prefix string, n int, ok bool) {
+	end := len(s)
+	start := end
+	for start > 0 && s[start-1] >= '0' && s[start-1] <= '9' {
+		start--
+	}
+	if start == end {
+		return s, 0, false
+	}
+	v, err := strconv.Atoi(s[start:])
+	if err != nil {
+		return s, 0, false
+	}
+	return s[:start], v, true
 }
 
 func (m *Model) setStudentOnline(id string, online bool) {
@@ -2332,6 +2806,46 @@ func parsePushOpenCmd(text string) (target, destStr string, ok bool) {
 	return
 }
 
+// parseStagedPushOpen detects the "send-and-open this attachment" syntax used
+// while a file is staged. Recognised forms (case-insensitive on the keyword):
+//
+//	--op this > *      --open this > *      --op > *      --open > *
+//	--op this > N      --open this > N      --op > N      --open > N
+//
+// Returns the destination string ("*" or numeric "N") and ok=true on match.
+// On match the caller should treat the staged file as the target and clear
+// the message text so the directive doesn't end up as the file caption.
+func parseStagedPushOpen(text string) (destStr string, ok bool) {
+	s := strings.TrimSpace(text)
+	var tail string
+	switch {
+	case strings.HasPrefix(s, "--op "):
+		tail = strings.TrimSpace(strings.TrimPrefix(s, "--op "))
+	case strings.HasPrefix(s, "--open "):
+		tail = strings.TrimSpace(strings.TrimPrefix(s, "--open "))
+	default:
+		return
+	}
+	// Optional "this" keyword right after --op
+	if strings.HasPrefix(tail, "this") {
+		tail = strings.TrimSpace(strings.TrimPrefix(tail, "this"))
+	}
+	if !strings.HasPrefix(tail, ">") {
+		return
+	}
+	destStr = strings.TrimSpace(strings.TrimPrefix(tail, ">"))
+	if destStr == "" {
+		destStr = "*"
+	}
+	// Reject anything trailing — keeps the syntax tight; if a teacher wants a
+	// caption with the push, they can do it as the two-step flow.
+	if strings.ContainsAny(destStr, " \t") {
+		return "", false
+	}
+	ok = true
+	return
+}
+
 // resolveStudentTarget maps ">N" / "*" to a student ID and display label.
 func (m *Model) resolveStudentTarget(destStr string) (id, label string, err error) {
 	if destStr == "*" || destStr == "" {
@@ -2589,7 +3103,8 @@ var knownCmdTokens = map[string]bool{
 	"--set": true,
 	"--cast": true,
 	"--mon": true, "--monitor": true,
-	"--log": true,
+	"--log":  true,
+	"--pa":   true, "--path": true,
 }
 
 // looksLikeCommand returns true when any whitespace-separated token exactly
@@ -2669,7 +3184,7 @@ func (m *Model) overlayList(base string) string {
 	}
 
 	var out []string
-	out = append(out, styleTitle.Render("  📋 Λίστες"))
+	out = append(out, styleTitle.Render("  📋 Content (G)ate — Λίστες"))
 	out = append(out, strings.Repeat("─", overlayW))
 	for _, l := range lines[start:end] {
 		out = append(out, lipgloss.NewStyle().Width(overlayW).Foreground(colText).Render(l))
