@@ -92,8 +92,19 @@ func (a *App) FavoritesSnapshot() []FavoriteEntry {
 }
 
 func (a *App) loadFavorites() {
-	data, err := os.ReadFile(filepath.Join(a.DataDir, favoritesFile))
+	path := filepath.Join(a.DataDir, favoritesFile)
+	data, err := os.ReadFile(path)
 	if err != nil {
+		// First launch (or file missing): seed teacher with the default classroom
+		// app list ported from ClassSend v1's launcher. Student role gets nothing.
+		if os.IsNotExist(err) && a.Role == RoleTeacher {
+			seeded := defaultFavorites()
+			a.mu.Lock()
+			a.Favorites = seeded
+			snap := append([]FavoriteEntry(nil), a.Favorites...)
+			a.mu.Unlock()
+			go saveFavorites(a.DataDir, snap)
+		}
 		return
 	}
 	var entries []FavoriteEntry
@@ -103,6 +114,50 @@ func (a *App) loadFavorites() {
 	a.mu.Lock()
 	a.Favorites = entries
 	a.mu.Unlock()
+}
+
+// defaultFavorites returns the seed list ported from ClassSend v1's app
+// launcher (PREDEFINED_APPS + PREDEFINED_DOCS in client/main.js). AddedAt
+// is staggered so the order in this slice is the order shown in ^N.
+func defaultFavorites() []FavoriteEntry {
+	paths := []string{
+		// Educational / classroom apps
+		`C:\Program Files\GCompris-Qt\bin\GCompris.exe`,
+		`%LocalAppData%\ScratchJr\ScratchJr.exe`,
+		`C:\Program Files (x86)\Scratch 3\Scratch 3.exe`,
+		`C:\Program Files (x86)\Sebran\SEBRAN.EXE`,
+		`C:\Program Files\TuxPaint\tuxpaint.exe`,
+		`C:\Program Files\PictoBlox\PictoBlox.exe`,
+		// Games
+		`C:\Program Files\SuperTux\bin\supertux2.exe`,
+		`C:\Program Files\SuperTuxKart 1.5\supertuxkart.exe`,
+		// Browsers
+		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		// Office / productivity
+		`C:\Program Files\ONLYOFFICE\DesktopEditors\DesktopEditors.exe`,
+		`C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE`,
+		`C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE`,
+		`C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE`,
+		`C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE`,
+		`C:\Program Files\Microsoft Office\root\Office16\POWERPNT.EXE`,
+		`C:\Program Files (x86)\Microsoft Office\root\Office16\POWERPNT.EXE`,
+		`C:\Program Files\LibreOffice\program\swriter.exe`,
+		`C:\Program Files\LibreOffice\program\scalc.exe`,
+		`C:\Program Files\LibreOffice\program\simpress.exe`,
+		// Media
+		`C:\Program Files\kdenlive\bin\kdenlive.exe`,
+		`C:\Program Files\Audacity\Audacity.exe`,
+		// Windows built-ins
+		`C:\Windows\System32\mspaint.exe`,
+		`C:\Windows\System32\notepad.exe`,
+		`C:\Windows\System32\calc.exe`,
+	}
+	now := time.Now().Unix()
+	out := make([]FavoriteEntry, len(paths))
+	for i, p := range paths {
+		out[i] = FavoriteEntry{Value: p, AddedAt: now - int64(i)}
+	}
+	return out
 }
 
 // saveFavorites is package-level (not a method) so the goroutine launched

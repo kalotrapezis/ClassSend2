@@ -83,6 +83,7 @@ func main() {
 
 	// System commands: lock screen, mute, screenshot, etc.
 	setupStudentCommands(app, *dev)
+	startHealthBeacon()
 	app.SetAutostart = setAutostart
 	app.IsAutostartEnabled = isAutostartEnabled
 	if !*dev {

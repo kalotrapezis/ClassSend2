@@ -4,7 +4,7 @@ setlocal
 rem Single source of truth for the version. Bump the trailing letter on each
 rem rebuild so the user can tell which build the EXEs/installer came from.
 rem Must match setup\classsend2.iss MyAppVersion.
-set VERSION=0.0.8
+set VERSION=0.0.9
 
 rem build-release.bat may set VERSION_OVERRIDE / RELEASE_FLAGS to ship a clean
 rem versioned, logging-disabled build without editing this file.

@@ -3,9 +3,12 @@
 package monitoring
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"image/jpeg"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -13,6 +16,50 @@ import (
 
 	"classsend/internal/devlog"
 )
+
+// isShotMostlyBlack decodes the JPEG and samples a 16×16 pixel grid to compute
+// average Rec.601 luma. Returns true if the image is dark enough that BitBlt
+// likely returned a stale/cleared back-buffer instead of the real desktop —
+// the well-known DWM compositor quirk on certain Win10 Intel iGPU drivers,
+// where a fraction of BitBlts (sometimes 2-of-3 in a clockwork pattern) come
+// back as solid black even though the screen has real content.
+//
+// We can't detect this condition on the agent side reliably (the ratio shifts
+// with load, monitor count, and other compositor state — engineering for a
+// specific number is fragile). Instead the teacher inspects every shot and
+// drops the black ones, asking that student again immediately.
+//
+// Decode cost: ~2-5 ms for a 640 px thumbnail, ~30-50 ms for a 2400 px focus
+// shot. Sampling 256 pixels after decode is microseconds.
+func isShotMostlyBlack(jpegData []byte) bool {
+	img, err := jpeg.Decode(bytes.NewReader(jpegData))
+	if err != nil {
+		// Couldn't decode → assume non-black so we don't drop legit frames
+		// just because the JPEG is in some weird format.
+		return false
+	}
+	bounds := img.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	if w == 0 || h == 0 {
+		return true
+	}
+	const grid = 16
+	const threshold = 8 // 0..255 — same threshold the WebView2 monitoring used
+	var sum, count int64
+	for gy := 0; gy < grid; gy++ {
+		y := bounds.Min.Y + gy*h/grid
+		for gx := 0; gx < grid; gx++ {
+			x := bounds.Min.X + gx*w/grid
+			r, g, b, _ := img.At(x, y).RGBA()
+			// RGBA() returns 16-bit values; shift to 8-bit for luma calc.
+			r8, g8, b8 := int64(r>>8), int64(g>>8), int64(b>>8)
+			sum += (r8*299 + g8*587 + b8*114) / 1000
+			count++
+		}
+	}
+	return sum/count < threshold
+}
 
 // Pipe protocol message types — must match monitoring.exe.
 //
@@ -367,6 +414,85 @@ func StartSession(
 	// Back-channel reader: monitoring.exe → teacher. Owns its own pipeOp.
 	go readPipeBackChannel(pipe, &focusIdx, stopCh)
 
+	// Two decoupled goroutines:
+	//
+	//   REQUEST PACER  — sends ONE CmdRequestShot every ~2 s in round-
+	//   robin order. Sequential, slow, polite to the WiFi. Does NOT wait
+	//   for the response.
+	//
+	//   RESPONSE ROUTER — drains shotCh forever. Every shot that arrives
+	//   is routed to its cell by hostname → index lookup, no matter when
+	//   it arrived or whose "turn" it was. Also owns all pipe writes
+	//   (Init / Shot / Offline / Stop) — a single goroutine on writeOp,
+	//   so no concurrency on the OVERLAPPED struct.
+	//
+	// Why this shape: with ~60% capture-failure rate per call on flaky
+	// BitBlt drivers, we want every successful frame the agent ever
+	// produces to land in its cell, regardless of timing. We can't fix
+	// the agent's per-PC capture quirks; we can stop discarding the
+	// frames it does manage to send. Each PC is independent.
+
+	// Per-student state shared by both goroutines.
+	//
+	//   lastSeen      — last time any shot was routed for this student.
+	//                   Used to mark cells offline after a quiet period.
+	//   outstanding   — count of CmdRequestShot's sent without ANY shot
+	//                   coming back. Reset to 0 every time we hear back.
+	//   nextOK        — earliest time the pacer will send to this student
+	//                   again. Cleared when a shot arrives.
+	//   blackStreak   — consecutive black shots received. Reset on a
+	//                   non-black one. Caps the retry-on-black loop so
+	//                   we don't spam the agent forever when capture is
+	//                   permanently broken.
+	//   hasGoodFrame  — true once we've routed a non-black frame from this
+	//                   student. The black filter ONLY suppresses frames
+	//                   when this is true — so a brand-new cell whose
+	//                   first capture is black still gets painted (better
+	//                   to show something than the placeholder forever).
+	//
+	// Backoff schedule (slow classroom hardware — Edge takes 30 s to open,
+	// Compress 60 s; we don't want to hammer a stalled PC, but we also can't
+	// give up on it for too long):
+	//
+	//   outstanding < 2  → no delay (send on the next 2 s slot)
+	//   outstanding == 2 → wait 10 s before next send
+	//   outstanding ≥ 3 → wait 20 min before next send
+	type studentState struct {
+		lastSeen     time.Time
+		outstanding  int
+		nextOK       time.Time
+		blackStreak  int
+		hasGoodFrame bool
+	}
+	stateMu := &sync.Mutex{}
+	states := make(map[string]*studentState, len(students))
+	for _, st := range students {
+		states[st.Hostname] = &studentState{lastSeen: time.Now()}
+	}
+
+	getState := func(hostname string) *studentState {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		s, ok := states[hostname]
+		if !ok {
+			s = &studentState{lastSeen: time.Now()}
+			states[hostname] = s
+		}
+		return s
+	}
+
+	backoffFor := func(outstanding int) time.Duration {
+		switch {
+		case outstanding < 2:
+			return 0
+		case outstanding == 2:
+			return 10 * time.Second
+		default:
+			return 20 * time.Minute
+		}
+	}
+
+	// Response router.
 	go func() {
 		defer func() {
 			// Best-effort: tell monitoring.exe we're done, then close pipe.
@@ -380,42 +506,130 @@ func StartSession(
 		}()
 
 		lastStudents := students
-		for {
-			current := getStudents()
+		offlineTicker := time.NewTicker(2 * time.Second)
+		defer offlineTicker.Stop()
 
-			// Re-send INIT whenever the student list changes
-			if studentsChanged(lastStudents, current) {
-				if err := pipeInit(pipe, writeOp, current); err != nil {
-					return // pipe broken — monitoring.exe closed
+		// Cap on how many times we'll re-request from the same student
+		// in a row when every response comes back black. After this we
+		// give up and let the pacer's normal cadence ask again next slot
+		// — the cell keeps its last good thumbnail, no flicker to black.
+		const blackRetryCap = 3
+
+		for {
+			select {
+			case shot := <-shotCh:
+				current := getStudents()
+				if studentsChanged(lastStudents, current) {
+					if err := pipeInit(pipe, writeOp, current); err != nil {
+						return
+					}
+					lastStudents = current
 				}
-				lastStudents = current
+
+				// Filter all-black frames — but only when the cell already
+				// has a good thumbnail to keep showing. A brand-new cell
+				// whose first capture is black still gets painted (better
+				// to show *something* there than to leave the placeholder
+				// "Αναμονή..." indefinitely on a PC whose BitBlt is broken).
+				black := isShotMostlyBlack(shot.Data)
+
+				stateMu.Lock()
+				s, ok := states[shot.StudentID]
+				if !ok {
+					s = &studentState{}
+					states[shot.StudentID] = s
+				}
+				s.outstanding = 0
+				s.nextOK = time.Time{}
+				s.lastSeen = time.Now()
+				if black {
+					s.blackStreak++
+				} else {
+					s.blackStreak = 0
+					s.hasGoodFrame = true
+				}
+				suppress := black && s.hasGoodFrame
+				retryAgain := suppress && s.blackStreak <= blackRetryCap
+				streak := s.blackStreak
+				stateMu.Unlock()
+
+				if suppress {
+					if retryAgain {
+						devlog.Logf("monitoring: black shot, retrying  student=%s streak=%d", shot.StudentID, streak)
+						go func(id, host string) {
+							if err := sendCmd(id, ""); err != nil {
+								devlog.Logf("monitoring: black-retry sendCmd failed  student=%s err=%v", host, err)
+							}
+						}(getIDForHostname(current, shot.StudentID), shot.StudentID)
+					} else {
+						devlog.Logf("monitoring: black shot, retry cap hit  student=%s streak=%d (giving up this round)", shot.StudentID, streak)
+					}
+					// Don't paint — cell keeps its last good thumbnail.
+					break
+				}
+
+				// Either non-black, or first-ever frame for this cell — paint it.
+				for i, st := range current {
+					if st.Hostname == shot.StudentID {
+						if err := pipeShot(pipe, writeOp, uint32(i), shot.Data); err != nil {
+							devlog.Logf("monitoring: pipeShot FAILED idx=%d err=%v", i, err)
+							return
+						}
+						tag := "ok"
+						if black {
+							tag = "first-black"
+						}
+						devlog.Logf("monitoring: shot routed  student=%s idx=%d jpeg=%dB (%s)", st.Hostname, i, len(shot.Data), tag)
+						break
+					}
+				}
+			case <-offlineTicker.C:
+				current := getStudents()
+				if studentsChanged(lastStudents, current) {
+					if err := pipeInit(pipe, writeOp, current); err != nil {
+						return
+					}
+					lastStudents = current
+				}
+				now := time.Now()
+				stateMu.Lock()
+				for i, st := range current {
+					s, ok := states[st.Hostname]
+					if !ok || now.Sub(s.lastSeen) > 30*time.Second {
+						if err := pipeOffline(pipe, writeOp, uint32(i)); err != nil {
+							stateMu.Unlock()
+							return
+						}
+					}
+				}
+				stateMu.Unlock()
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+
+	// Request pacer.
+	go func() {
+		idx := 0
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
 			}
 
 			fi := int(focusIdx.Load())
+			current := getStudents()
+
 			if fi >= 0 && fi < len(current) {
-				// Focus mode: only poll the focused student, ask for hi-res.
+				// Focus mode — ask only the focused student, hi-res, ~1 fps.
+				// Backoff doesn't apply: the teacher is actively watching this
+				// PC and explicitly asked for hi-res; we keep trying.
 				st := current[fi]
 				if err := sendCmd(st.ID, "hi"); err != nil {
-					devlog.Logf("monitoring: focus sendCmd failed  student=%s id=%s err=%v", st.Hostname, st.ID, err)
-					if err := pipeOffline(pipe, writeOp, uint32(fi)); err != nil {
-						return
-					}
-				} else {
-					got := waitForShot(shotCh, st.Hostname, 2500*time.Millisecond, stopCh)
-					if got == nil {
-						devlog.Logf("monitoring: focus shot TIMEOUT  student=%s", st.Hostname)
-						if err := pipeOffline(pipe, writeOp, uint32(fi)); err != nil {
-							return
-						}
-					} else {
-						if err := pipeShot(pipe, writeOp, uint32(fi), got); err != nil {
-							devlog.Logf("monitoring: pipeShot send failed: %v", err)
-							return
-						}
-						devlog.Logf("monitoring: focus shot sent  student=%s  jpeg=%dB", st.Hostname, len(got))
-					}
+					devlog.Logf("monitoring: focus sendCmd failed  student=%s err=%v", st.Hostname, err)
 				}
-				// Tighter loop in focus mode — ~1 fps for live-ish feel
 				select {
 				case <-time.After(800 * time.Millisecond):
 				case <-wakeCh:
@@ -425,50 +639,43 @@ func StartSession(
 				continue
 			}
 
-			// Grid mode: round-robin all students.
-			devlog.Logf("monitoring: grid round  students=%d", len(current))
-			for i, st := range current {
-				if focusIdx.Load() >= 0 {
-					break // focus mode entered mid-round, abort
-				}
-				devlog.Logf("monitoring: sendCmd START  student=%s idx=%d", st.Hostname, i)
-				sendStart := time.Now()
-				if err := sendCmd(st.ID, ""); err != nil {
-					devlog.Logf("monitoring: sendCmd FAILED  student=%s after=%v err=%v", st.Hostname, time.Since(sendStart), err)
-					if err := pipeOffline(pipe, writeOp, uint32(i)); err != nil {
-						return
-					}
-					continue
-				}
-				devlog.Logf("monitoring: sendCmd OK  student=%s after=%v", st.Hostname, time.Since(sendStart))
+			// Grid mode — find the next student in round-robin order who
+			// isn't currently in backoff. If everyone's backed off, just
+			// sleep and try again next tick.
+			if len(current) > 0 {
+				now := time.Now()
+				for tries := 0; tries < len(current); tries++ {
+					st := current[(idx+tries)%len(current)]
+					s := getState(st.Hostname)
 
-				devlog.Logf("monitoring: waitForShot START  student=%s", st.Hostname)
-				waitStart := time.Now()
-				got := waitForShot(shotCh, st.Hostname, 1500*time.Millisecond, stopCh)
-				if got == nil {
-					devlog.Logf("monitoring: shot TIMEOUT  student=%s after=%v idx=%d", st.Hostname, time.Since(waitStart), i)
-					if err := pipeOffline(pipe, writeOp, uint32(i)); err != nil {
-						return
+					stateMu.Lock()
+					inBackoff := now.Before(s.nextOK)
+					stateMu.Unlock()
+					if inBackoff {
+						continue
 					}
-				} else {
-					devlog.Logf("monitoring: waitForShot OK  student=%s after=%v jpeg=%dB", st.Hostname, time.Since(waitStart), len(got))
-					devlog.Logf("monitoring: pipeShot START  idx=%d", i)
-					pipeStart := time.Now()
-					if err := pipeShot(pipe, writeOp, uint32(i), got); err != nil {
-						devlog.Logf("monitoring: pipeShot FAILED after=%v err=%v", time.Since(pipeStart), err)
-						return
-					}
-					devlog.Logf("monitoring: pipeShot OK  student=%s after=%v jpeg=%dB", st.Hostname, time.Since(pipeStart), len(got))
-				}
 
-				select {
-				case <-time.After(150 * time.Millisecond):
-				case <-stopCh:
-					return
+					if err := sendCmd(st.ID, ""); err != nil {
+						devlog.Logf("monitoring: sendCmd failed  student=%s err=%v", st.Hostname, err)
+					} else {
+						stateMu.Lock()
+						s.outstanding++
+						if d := backoffFor(s.outstanding); d > 0 {
+							s.nextOK = now.Add(d)
+							devlog.Logf("monitoring: backoff  student=%s outstanding=%d wait=%v",
+								st.Hostname, s.outstanding, d)
+						}
+						stateMu.Unlock()
+					}
+					idx = (idx + tries + 1) % len(current)
+					break
 				}
 			}
 
-			// Pause between full rounds
+			// Pace: one request every 2 s. With 9 students and nobody in
+			// backoff that's a full round every ~18 s. Slow agents that miss
+			// twice get parked for 10 s, then 20 min if still silent — a
+			// realistic window given Edge takes 30 s to open and Compress 60 s.
 			select {
 			case <-time.After(2 * time.Second):
 			case <-wakeCh:
@@ -539,8 +746,8 @@ func readPipeBackChannel(handle uintptr, focusIdx *atomic.Int32, stop <-chan str
 }
 
 // waitForShot blocks until a screenshot from hostname arrives or deadline/stop.
-// Shots from other students are silently discarded — they'll be requested again
-// in the next monitoring round.
+// Shots from other students are silently discarded — used by focus mode where
+// only one student is being polled and stray frames are uninteresting.
 func waitForShot(ch <-chan ShotMsg, hostname string, timeout time.Duration, stop <-chan struct{}) []byte {
 	deadline := time.After(timeout)
 	for {
@@ -556,6 +763,63 @@ func waitForShot(ch <-chan ShotMsg, hostname string, timeout time.Duration, stop
 			return nil
 		}
 	}
+}
+
+// waitForShotDispatch is the grid-mode variant: any shot for *any* student
+// in `students` is forwarded to its own cell so a late frame from a slow
+// student doesn't end up in the bin just because we've already moved on to
+// poll the next one. Returns the target student's frame bytes, or nil on
+// timeout. Why this exists: BitBlt on Win10 occasionally takes 1.5–2 s to
+// return; the previous waitForShot would discard those frames as "wrong
+// student" because the loop had already advanced. Slow students therefore
+// updated their cell roughly never. With dispatch-in-flight, every shot that
+// makes it across the wire lands in the right cell, regardless of timing.
+func waitForShotDispatch(
+	ch <-chan ShotMsg,
+	target string,
+	students []StudentInfo,
+	pipe uintptr,
+	op *pipeOp,
+	timeout time.Duration,
+	stop <-chan struct{},
+) []byte {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case shot := <-ch:
+			if shot.StudentID == target {
+				return shot.Data
+			}
+			// Late shot from another student — route it to its cell now
+			// instead of discarding. If the hostname isn't in the current
+			// list (student left), drop silently.
+			for i, st := range students {
+				if st.Hostname == shot.StudentID {
+					if err := pipeShot(pipe, op, uint32(i), shot.Data); err != nil {
+						devlog.Logf("monitoring: late-shot pipe failed  student=%s err=%v", shot.StudentID, err)
+					} else {
+						devlog.Logf("monitoring: late-shot routed  student=%s idx=%d jpeg=%dB", shot.StudentID, i, len(shot.Data))
+					}
+					break
+				}
+			}
+		case <-deadline:
+			return nil
+		case <-stop:
+			return nil
+		}
+	}
+}
+
+// getIDForHostname looks up a student's ID by hostname in the current list.
+// Returns "" if not found, in which case sendCmd will fail harmlessly.
+func getIDForHostname(students []StudentInfo, hostname string) string {
+	for _, st := range students {
+		if st.Hostname == hostname {
+			return st.ID
+		}
+	}
+	return ""
 }
 
 // studentsChanged returns true if the two lists differ in any way.
