@@ -4,14 +4,18 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -35,8 +39,11 @@ var (
 	procReleaseDC              = user32.NewProc("ReleaseDC")
 	procGetSystemMetrics       = user32.NewProc("GetSystemMetrics")
 	procSetProcessDPIAware     = user32.NewProc("SetProcessDPIAware")
+	procGetGuiResources        = user32.NewProc("GetGuiResources") // diagnostic: per-process GDI/USER handle count
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	procCreateDIBSection       = gdi32.NewProc("CreateDIBSection") // modern alternative to GetDIBits — direct memory pixels
+	procGdiFlush               = gdi32.NewProc("GdiFlush")          // commits pending GDI ops before reading DIBSection bits
 	procSelectObject           = gdi32.NewProc("SelectObject")
 	procBitBlt                 = gdi32.NewProc("BitBlt")
 	procDeleteObject           = gdi32.NewProc("DeleteObject")
@@ -49,6 +56,7 @@ var (
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
 	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
 	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	procGetMessageW         = user32.NewProc("GetMessageW")
@@ -173,6 +181,8 @@ const (
 
 	wsExToolWindow = 0x00000080
 	wsExNoActivate = 0x08000000
+	wsExLayered    = 0x00080000
+	lwaAlpha       = 0x00000002
 	wmErasebkgnd   = 0x0014
 )
 
@@ -276,41 +286,261 @@ func captureScreen() ([]byte, error) { return captureScreenSized(640, 50) }
 // typical desktops, still well under the 1 MB pipe buffer.
 func captureScreenHi() ([]byte, error) { return captureScreenSized(2400, 80) }
 
+// ── "Technical difficulties" placeholder ────────────────────────────────────
+//
+// When BitBlt produces a zero buffer (luma == 0 — the agent literally has
+// nothing real to send), we substitute a clearly-marked placeholder JPEG so
+// the teacher sees "this PC's capture is broken" instead of an unhelpful
+// black thumbnail indistinguishable from "the user has a black wallpaper".
+// Generated once and cached by (width, quality).
+
+// font5x7 — bitmap font for the placeholder text. Each glyph is a 5-bit-wide,
+// 7-row pattern. Bit 4 (0x10) is the leftmost pixel; bit 0 (0x01) the right.
+// Only the characters we need for the message.
+var font5x7 = map[rune][7]byte{
+	' ': {0, 0, 0, 0, 0, 0, 0},
+	'A': {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+	'B': {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+	'C': {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
+	'D': {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+	'E': {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+	'F': {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+	'H': {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+	'I': {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
+	'L': {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+	'N': {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
+	'O': {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+	'P': {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+	'R': {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+	'S': {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
+	'T': {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+	'U': {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+	'Y': {0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04},
+	'-': {0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00},
+	'.': {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04},
+	':': {0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00},
+}
+
+// drawText draws s at (px,py) into img using fg, scaled by `scale` (each font
+// pixel becomes scale×scale pixels). Characters are 5 wide + 1 spacing × scale.
+func drawText(img *image.RGBA, s string, px, py, scale int, fg color.RGBA) {
+	for _, r := range s {
+		glyph, ok := font5x7[r]
+		if !ok {
+			glyph = font5x7[' ']
+		}
+		for row := 0; row < 7; row++ {
+			b := glyph[row]
+			for col := 0; col < 5; col++ {
+				if b&(1<<(4-col)) != 0 {
+					for sy := 0; sy < scale; sy++ {
+						for sx := 0; sx < scale; sx++ {
+							img.SetRGBA(px+col*scale+sx, py+row*scale+sy, fg)
+						}
+					}
+				}
+			}
+		}
+		px += 6 * scale // 5 char + 1 spacing
+	}
+}
+
+var (
+	placeholderMu    sync.Mutex
+	placeholderCache = map[int][]byte{} // key: maxEdge encodes both size+quality bucket
+)
+
+// makeFailurePlaceholder returns a JPEG showing "TECHNICAL DIFFICULTIES" on
+// an amber/black hazard background. Cached per maxEdge — same bytes are
+// returned every time so we don't re-encode on every failed capture.
+func makeFailurePlaceholder(maxEdge, quality int) []byte {
+	placeholderMu.Lock()
+	defer placeholderMu.Unlock()
+	if b, ok := placeholderCache[maxEdge]; ok {
+		return b
+	}
+
+	w := 640
+	if maxEdge < 640 {
+		w = maxEdge
+	}
+	h := w * 9 / 16
+
+	bg := color.RGBA{30, 18, 0, 255}    // very dark amber
+	band := color.RGBA{180, 110, 20, 255} // hazard amber
+	stripe := color.RGBA{20, 12, 0, 255}  // dark
+	fg := color.RGBA{255, 200, 60, 255}   // bright amber for text
+
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetRGBA(x, y, bg)
+		}
+	}
+
+	// Top + bottom hazard stripes (~15% of height each).
+	stripeH := h * 15 / 100
+	stripeWidth := stripeH / 2
+	if stripeWidth < 8 {
+		stripeWidth = 8
+	}
+	for y := 0; y < stripeH; y++ {
+		for x := 0; x < w; x++ {
+			pat := ((x + y) / stripeWidth) & 1
+			c := band
+			if pat == 1 {
+				c = stripe
+			}
+			img.SetRGBA(x, y, c)
+			img.SetRGBA(x, h-1-y, c)
+		}
+	}
+
+	// Center the message.
+	const msg = "TECHNICAL DIFFICULTIES"
+	scale := w / 200
+	if scale < 2 {
+		scale = 2
+	}
+	textW := len(msg) * 6 * scale
+	textH := 7 * scale
+	tx := (w - textW) / 2
+	ty := (h - textH) / 2
+	drawText(img, msg, tx, ty, scale, fg)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		// Should never happen on a freshly-built RGBA, but if it does,
+		// return a minimal valid JPEG so callers don't choke. Empty bytes
+		// would fail the teacher's JPEG-magic check.
+		return nil
+	}
+	out := buf.Bytes()
+	placeholderCache[maxEdge] = out
+	return out
+}
+
+// sampleLumaBGRA computes average Rec.601 luma over a 16×16 sample grid of
+// raw BGRA bytes (BEFORE the in-place swap to RGBA). Returns 0..255. Used
+// as a diagnostic so the agent log records whether BitBlt itself returned
+// black for each capture, completely independent of network / pipe / decode.
+func sampleLumaBGRA(raw []byte, w, h int) int {
+	if len(raw) == 0 || w <= 0 || h <= 0 {
+		return 0
+	}
+	const grid = 16
+	stride := w * 4
+	var sum, count int64
+	for gy := 0; gy < grid; gy++ {
+		y := gy * h / grid
+		for gx := 0; gx < grid; gx++ {
+			x := gx * w / grid
+			off := y*stride + x*4
+			if off+3 >= len(raw) {
+				continue
+			}
+			b := int64(raw[off+0])
+			g := int64(raw[off+1])
+			r := int64(raw[off+2])
+			sum += (r*299 + g*587 + b*114) / 1000
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return int(sum / count)
+}
+
 func captureScreenSized(maxEdge int, quality int) ([]byte, error) {
 	ensureDPIAware()
+	t0 := time.Now()
 
 	desktop, _, _ := procGetDesktopWindow.Call()
 	hdcScreen, _, _ := procGetDC.Call(desktop)
+	if hdcScreen == 0 {
+		devlog.Logf("capture: GetDC FAILED")
+		return nil, fmt.Errorf("GetDC returned 0")
+	}
 	defer procReleaseDC.Call(desktop, hdcScreen)
 
 	w, _, _ := procGetSystemMetrics.Call(smCxScreen)
 	h, _, _ := procGetSystemMetrics.Call(smCyScreen)
 
 	hdcMem, _, _ := procCreateCompatibleDC.Call(hdcScreen)
+	if hdcMem == 0 {
+		devlog.Logf("capture: CreateCompatibleDC FAILED w=%d h=%d", w, h)
+		return nil, fmt.Errorf("CreateCompatibleDC returned 0")
+	}
 	defer procDeleteDC.Call(hdcMem)
 
-	hBmp, _, _ := procCreateCompatibleBitmap.Call(hdcScreen, w, h)
-	defer procDeleteObject.Call(hBmp)
-
-	procSelectObject.Call(hdcMem, hBmp)
-	procBitBlt.Call(hdcMem, 0, 0, w, h, hdcScreen, 0, 0, srcCopy|captureBlt)
-
+	// CreateDIBSection allocates a bitmap whose pixel memory is mapped
+	// directly into the process address space. After BitBlt the BGRA bytes
+	// are sitting at *pBits — no GetDIBits call needed, no "is the bitmap
+	// selected?" dance. This is what every working Win32 screen capture
+	// library uses; it sidesteps the silent GetDIBits=0 failure that the
+	// older code hit on this Win10 / Intel iGPU box.
 	bi := bitmapInfoHeader{
 		biSize:        40,
 		biWidth:       int32(w),
-		biHeight:      -int32(h),
+		biHeight:      -int32(h), // negative = top-down DIB (origin top-left)
 		biPlanes:      1,
 		biBitCount:    32,
 		biCompression: biRgb,
 	}
-
-	raw := make([]byte, w*h*4)
-	procGetDIBits.Call(
-		hdcScreen, hBmp, 0, h,
-		uintptr(unsafe.Pointer(&raw[0])),
+	var pBits uintptr
+	hBmp, _, _ := procCreateDIBSection.Call(
+		hdcScreen,
 		uintptr(unsafe.Pointer(&bi)),
 		dibRgbColors,
+		uintptr(unsafe.Pointer(&pBits)),
+		0, 0,
 	)
+	if hBmp == 0 || pBits == 0 {
+		gdi, user := gdiHandleCount()
+		devlog.Logf("capture: CreateDIBSection FAILED w=%d h=%d gdi=%d user=%d", w, h, gdi, user)
+		return nil, fmt.Errorf("CreateDIBSection returned 0")
+	}
+	defer procDeleteObject.Call(hBmp)
+
+	hOld, _, _ := procSelectObject.Call(hdcMem, hBmp)
+	defer procSelectObject.Call(hdcMem, hOld)
+
+	setupMs := time.Since(t0).Milliseconds()
+	tBlit := time.Now()
+	rb, _, _ := procBitBlt.Call(hdcMem, 0, 0, w, h, hdcScreen, 0, 0, srcCopy|captureBlt)
+	blitMs := time.Since(tBlit).Milliseconds()
+	if rb == 0 {
+		devlog.Logf("capture: BitBlt returned 0 w=%d h=%d", w, h)
+	}
+
+	// GdiFlush forces all pending GDI ops on this thread to complete before
+	// we read pBits. Without it the BitBlt may still be queued in the driver
+	// and we'd read pre-blit memory.
+	procGdiFlush.Call()
+
+	// Copy the pixels out — pBits memory is freed by DeleteObject(hBmp).
+	rawSize := int(w) * int(h) * 4
+	raw := make([]byte, rawSize)
+	src := unsafe.Slice((*byte)(unsafe.Pointer(pBits)), rawSize)
+	copy(raw, src)
+
+	// Sample BEFORE the swap so we measure exactly what BitBlt produced.
+	luma := sampleLumaBGRA(raw, int(w), int(h))
+
+	// If BitBlt produced a zero buffer (or essentially zero), substitute the
+	// "Technical difficulties" placeholder so the teacher gets a visibly
+	// distinct cell rather than a thumbnail of pure black. This happens on
+	// hybrid-graphics laptops where our process ends up bound to one GPU
+	// while DWM composes on the other — BitBlt succeeds at the API level
+	// but the driver leaves our buffer untouched.
+	if luma < 2 {
+		ph := makeFailurePlaceholder(maxEdge, quality)
+		gdi, user := gdiHandleCount()
+		devlog.Logf("capture: zero-buffer (luma=%d), sending placeholder  w=%d h=%d setup=%dms blit=%dms total=%dms jpeg=%dB gdi=%d user=%d",
+			luma, w, h, setupMs, blitMs, time.Since(t0).Milliseconds(), len(ph), gdi, user)
+		return ph, nil
+	}
 
 	for i := 0; i < len(raw); i += 4 {
 		raw[i+0], raw[i+2] = raw[i+2], raw[i+0]
@@ -320,13 +550,20 @@ func captureScreenSized(maxEdge int, quality int) ([]byte, error) {
 	img := &image.NRGBA{Pix: raw, Stride: int(w) * 4, Rect: image.Rect(0, 0, int(w), int(h))}
 
 	// Downscale before JPEG encode. Caller picks maxEdge: 640 for thumbnails,
-	// 1600 for focus mode (text-readable).
+	// 2400 for focus mode (text-readable).
 	small := downscaleNRGBA(img, maxEdge)
 
+	tEnc := time.Now()
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, small, &jpeg.Options{Quality: quality}); err != nil {
 		return nil, err
 	}
+	encMs := time.Since(tEnc).Milliseconds()
+
+	gdi, user := gdiHandleCount()
+	devlog.Logf("capture: w=%d h=%d luma=%d setup=%dms blit=%dms enc=%dms total=%dms jpeg=%dB gdi=%d user=%d",
+		w, h, luma, setupMs, blitMs, encMs, time.Since(t0).Milliseconds(), buf.Len(), gdi, user)
+
 	return buf.Bytes(), nil
 }
 
@@ -737,13 +974,15 @@ func runMonitorNotifWindow(hwndOut chan<- uintptr) {
 	notifY := uintptr(8)
 
 	hwnd, _, _ := procCreateWindowExW.Call(
-		wsExTopmost|wsExToolWindow|wsExNoActivate,
+		wsExTopmost|wsExToolWindow|wsExNoActivate|wsExLayered,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(utf16("ClassSend"))),
 		wsPopup|wsVisible,
 		notifX, notifY, notifW, notifH,
 		0, 0, hInst, 0,
 	)
+	// Start fully opaque.
+	procSetLayeredWindowAttributes.Call(hwnd, 0, 255, lwaAlpha)
 	procShowWindow.Call(hwnd, 5)
 	procSetWindowPos.Call(hwnd, hwndTopmost, notifX, notifY, notifW, notifH, swpShowWindow)
 
@@ -766,13 +1005,44 @@ func runMonitorNotifWindow(hwndOut chan<- uintptr) {
 
 func showMonitoringNotification() {
 	notifMu.Lock()
-	defer notifMu.Unlock()
 	if notifHwnd != 0 {
+		notifMu.Unlock()
 		return
 	}
 	ready := make(chan uintptr, 1)
 	go runMonitorNotifWindow(ready)
-	notifHwnd = <-ready
+	hwnd := <-ready
+	notifHwnd = hwnd
+	notifMu.Unlock()
+
+	// Auto-fade after 4 s. The banner is meant as an "I'm being watched
+	// right now" alert, not a permanent badge. Fades over 600 ms (12 steps
+	// of 50 ms) then closes the window. If hideMonitoringNotification is
+	// called explicitly first (CmdStopMonitor) the window is gone before
+	// the timer fires; the fade goroutine then sees notifHwnd == 0 and
+	// exits without touching anything.
+	go func(target uintptr) {
+		time.Sleep(4 * time.Second)
+		const steps = 12
+		for i := 0; i < steps; i++ {
+			notifMu.Lock()
+			gone := notifHwnd != target
+			notifMu.Unlock()
+			if gone {
+				return
+			}
+			alpha := uintptr(255 - 255*(i+1)/steps)
+			procSetLayeredWindowAttributes.Call(target, 0, alpha, lwaAlpha)
+			time.Sleep(50 * time.Millisecond)
+		}
+		// Fade complete — close.
+		notifMu.Lock()
+		stillOurs := notifHwnd == target
+		notifMu.Unlock()
+		if stillOurs {
+			procPostMessageW.Call(target, wmClose, 0, 0)
+		}
+	}(hwnd)
 }
 
 func hideMonitoringNotification() {
@@ -1107,6 +1377,104 @@ func withRetry(attempts int, delay time.Duration, fn func() error) error {
 	return lastErr
 }
 
+// ── Stress guard ──────────────────────────────────────────────────────────
+//
+// The agent runs on whatever the school issued — sometimes Atom-class
+// hardware on classroom WiFi. Without backpressure, every incoming
+// command spawned its own goroutine. When a teacher fired several
+// commands in quick succession (lock + close-apps + launch + monitoring
+// start) on a slow box, handlers (and the GDI/USER handles, sub-
+// processes, retry loops they hold) accumulated faster than they
+// completed and the agent eventually crashed on resource exhaustion.
+//
+// Self-protection layered in here:
+//
+//  1. stressSem caps concurrent handlers. Beyond the limit we don't
+//     queue indefinitely — we drop the command and tell the teacher.
+//  2. stressGuard returns false when full; the caller skips execution
+//     and SendCmdAck reports a "BUSY" failure so the teacher SEES that
+//     the agent is overloaded instead of silently losing the command.
+//  3. runGuarded recovers from any panic in a handler. One bad syscall
+//     can't take the whole agent down anymore — the slot is released
+//     and the next command can run.
+//  4. startHealthBeacon logs goroutines/heap/inflight every 30 s so a
+//     post-mortem on the devlog can spot resource creep across a
+//     session.
+const stressInflightLimit = 4
+
+var (
+	stressSem      = make(chan struct{}, stressInflightLimit)
+	stressBusyDrop atomic.Uint64
+	errAgentBusy   = errors.New("agent busy — command dropped")
+)
+
+// runGuarded wraps an async command handler. Tries to acquire a slot;
+// on failure sends a BUSY ack and returns. On success spawns the work
+// in a goroutine that is panic-safe and releases the slot when done.
+func runGuarded(app *core.App, cmd protocol.CommandPayload, fn func()) {
+	select {
+	case stressSem <- struct{}{}:
+		// got a slot
+	default:
+		stressBusyDrop.Add(1)
+		devlog.Logf("stress: BUSY drop  action=%s param=%q inflight=%d drops=%d",
+			cmd.Action, cmd.Param, len(stressSem), stressBusyDrop.Load())
+		if cmd.CmdID != "" {
+			app.SendCmdAck(cmd.CmdID, cmd.Action, errAgentBusy)
+		}
+		return
+	}
+	go func() {
+		defer func() {
+			<-stressSem
+			if r := recover(); r != nil {
+				devlog.Logf("PANIC in handler  action=%s err=%v\n%s",
+					cmd.Action, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
+
+// gdiHandleCount returns the current per-process GDI and USER object
+// counts. If either climbs steadily across the health beacon we have a
+// handle leak — Win10 caps each at 10 000 per process by default and
+// hitting that cap makes the agent unable to allocate any more drawing
+// resources (BitBlt fails, the agent appears hung). Pseudo-handle
+// (HANDLE)-1 = current process; no real syscall needed for that.
+const (
+	grGDIObjects  = 0
+	grUserObjects = 1
+)
+
+func gdiHandleCount() (gdi, user uint32) {
+	const currentProcess = ^uintptr(0)
+	g, _, _ := procGetGuiResources.Call(currentProcess, grGDIObjects)
+	u, _, _ := procGetGuiResources.Call(currentProcess, grUserObjects)
+	return uint32(g), uint32(u)
+}
+
+// startHealthBeacon kicks off a goroutine that periodically snapshots
+// agent process state into the devlog. Cheap, low-frequency — helps a
+// lot when reviewing logs after a crash.
+func startHealthBeacon() {
+	go func() {
+		var ms runtime.MemStats
+		for {
+			time.Sleep(30 * time.Second)
+			runtime.ReadMemStats(&ms)
+			gdi, user := gdiHandleCount()
+			devlog.Logf("health  goroutines=%d  heap=%d KB  inflight=%d  busy_drops=%d  gdi=%d  user=%d",
+				runtime.NumGoroutine(),
+				ms.HeapAlloc/1024,
+				len(stressSem),
+				stressBusyDrop.Load(),
+				gdi, user,
+			)
+		}
+	}()
+}
+
 func setupStudentCommands(app *core.App, devMode bool) {
 	sendShot := func(data []byte) {
 		msg, err := protocol.Encode(protocol.TypeScreenshot, protocol.ScreenshotPayload{
@@ -1136,7 +1504,7 @@ func setupStudentCommands(app *core.App, devMode bool) {
 		switch cmd.Action {
 
 		case protocol.CmdLockScreen:
-			go func() {
+			runGuarded(app, cmd, func() {
 				if err := withRetry(3, 500*time.Millisecond, lockScreen); err != nil {
 					report(cmd, err)
 					return
@@ -1145,38 +1513,40 @@ func setupStudentCommands(app *core.App, devMode bool) {
 					time.Sleep(5 * time.Second)
 					unlockScreen()
 				}
-			}()
+			})
 
 		case protocol.CmdUnlockScreen:
-			go func() { unlockScreen() }()
+			runGuarded(app, cmd, func() { unlockScreen() })
 
 		case protocol.CmdShutdown:
 			exec.Command("shutdown", "/s", "/f", "/t", "0").Start() //nolint:errcheck
 
 		case protocol.CmdLaunchApp:
 			if cmd.Param != "" {
-				go func(p string) {
+				p := cmd.Param
+				runGuarded(app, cmd, func() {
 					if err := withRetry(3, 500*time.Millisecond, func() error {
 						return launchApp(p)
 					}); err != nil {
 						report(cmd, err)
 					}
-				}(cmd.Param)
+				})
 			}
 
 		case protocol.CmdFocusApp:
 			if cmd.Param != "" {
-				go func(p string) {
+				p := cmd.Param
+				runGuarded(app, cmd, func() {
 					if err := withRetry(3, 500*time.Millisecond, func() error {
 						return focusApp(p)
 					}); err != nil {
 						report(cmd, err)
 					}
-				}(cmd.Param)
+				})
 			}
 
 		case protocol.CmdCloseApps:
-			go closeVisibleApps()
+			runGuarded(app, cmd, func() { closeVisibleApps() })
 
 		case protocol.CmdMute, protocol.CmdUnmute:
 			muteAudio()
@@ -1203,22 +1573,22 @@ func setupStudentCommands(app *core.App, devMode bool) {
 			// Empty / anything else => normal thumbnail.
 			hires := cmd.Param == "hi"
 			devlog.Logf("CmdRequestShot received  hi=%v", hires)
-			go func(hi bool) {
+			runGuarded(app, cmd, func() {
 				var (
 					data []byte
 					err  error
 				)
-				if hi {
+				if hires {
 					data, err = captureScreenHi()
 				} else {
 					data, err = captureScreen()
 				}
 				if err != nil {
-					devlog.Logf("captureScreen failed: %v  hi=%v", err, hi)
+					devlog.Logf("captureScreen failed: %v  hi=%v", err, hires)
 					return
 				}
 				sendShot(data)
-			}(hires)
+			})
 		}
 	}
 }
