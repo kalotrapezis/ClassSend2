@@ -659,6 +659,53 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		}
 
+	case " ", "pgdown":
+		// Space / PgDn = page down inside help & about overlays.
+		// When neither overlay is open the case is a no-op; the parent's
+		// noOverlay gate forwards the keypress to the textarea normally.
+		const helpVis = 22
+		page := helpVis - 2 // keep 2 lines of overlap between pages
+		if m.helpOpen {
+			lines := m.helpLines()
+			m.helpScroll += page
+			if max := len(lines) - helpVis; m.helpScroll > max {
+				m.helpScroll = max
+			}
+			if m.helpScroll < 0 {
+				m.helpScroll = 0
+			}
+			return nil
+		}
+		if m.aboutOpen {
+			lines := m.aboutLines()
+			m.aboutScroll += page
+			if max := len(lines) - helpVis; m.aboutScroll > max {
+				m.aboutScroll = max
+			}
+			if m.aboutScroll < 0 {
+				m.aboutScroll = 0
+			}
+			return nil
+		}
+
+	case "pgup":
+		const helpVis = 22
+		page := helpVis - 2
+		if m.helpOpen {
+			m.helpScroll -= page
+			if m.helpScroll < 0 {
+				m.helpScroll = 0
+			}
+			return nil
+		}
+		if m.aboutOpen {
+			m.aboutScroll -= page
+			if m.aboutScroll < 0 {
+				m.aboutScroll = 0
+			}
+			return nil
+		}
+
 	case "k":
 		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.filePickerOpen && !m.toolsOpen {
 			if m.selectedSt > 0 {
@@ -735,7 +782,7 @@ func (m *Model) trySend() tea.Cmd {
 
 	// Teacher: --del / --rem / --delete @X.Y  delete a message
 	if m.app.Role == core.RoleTeacher {
-		delCmd, delHasArg, delArg := parseAliasCmd(text, "--del", "--rem", "--delete")
+		delCmd, delHasArg, delArg := parseAliasCmd(text, "--rm", "--del", "--rem", "--delete")
 		if delCmd {
 			if !delHasArg {
 				m.pushSysMsg("Χρήση: --del @X.Y")
@@ -1126,21 +1173,35 @@ func (m *Model) handleToolCmd(raw string) tea.Cmd {
 		label string
 		param bool // expects a param (e.g. exe path)
 	}
+	// Each action has a short and a full form. Both forms are accepted at
+	// runtime and shown in the help. Keep aliases in sync with toolActionNames
+	// (input-coloring) and toolNames (Tab cycling).
 	actions := map[string]actionEntry{
+		"lk":               {protocol.CmdLockScreen, "🔒 Κλείδωμα", false},
 		"lock":             {protocol.CmdLockScreen, "🔒 Κλείδωμα", false},
+		"ulk":              {protocol.CmdUnlockScreen, "🔓 Ξεκλείδωμα", false},
 		"unlock":           {protocol.CmdUnlockScreen, "🔓 Ξεκλείδωμα", false},
+		"mu":               {protocol.CmdMute, "🔇 Σίγαση", false},
 		"mute":             {protocol.CmdMute, "🔇 Σίγαση", false},
+		"umu":              {protocol.CmdUnmute, "🔊 Κατάργηση σίγασης", false},
 		"unmute":           {protocol.CmdUnmute, "🔊 Κατάργηση σίγασης", false},
-		"start-monitoring": {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
-		"stop-monitoring":  {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
 		"tvon":             {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
+		"start-monitoring": {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
 		"tvoff":            {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
+		"stop-monitoring":  {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
+		"sh":               {protocol.CmdRequestShot, "📷 Στιγμιότυπο", false},
 		"shot":             {protocol.CmdRequestShot, "📷 Στιγμιότυπο", false},
+		"cl":               {protocol.CmdCloseApps, "❌ Κλείσιμο εφαρμογών", false},
 		"close":            {protocol.CmdCloseApps, "❌ Κλείσιμο εφαρμογών", false},
+		"sd":               {protocol.CmdShutdown, "⚡ Τερματισμός", false},
 		"shutdown":         {protocol.CmdShutdown, "⚡ Τερματισμός", false},
+		"bl":               {protocol.CmdBlockChat, "🚫 Αποκλεισμός chat", false},
 		"block":            {protocol.CmdBlockChat, "🚫 Αποκλεισμός chat", false},
+		"ubl":              {protocol.CmdUnblockChat, "✅ Αποδέσμευση chat", false},
 		"unblock":          {protocol.CmdUnblockChat, "✅ Αποδέσμευση chat", false},
+		"fc":               {protocol.CmdFocusApp, "🔍 Εστίαση", true},
 		"focus":            {protocol.CmdFocusApp, "🔍 Εστίαση", true},
+		"ln":               {protocol.CmdLaunchApp, "🚀 Εκκίνηση", true},
 		"launch":           {protocol.CmdLaunchApp, "🚀 Εκκίνηση", true},
 	}
 
@@ -1246,31 +1307,191 @@ func (m *Model) pushSysMsg(text string) {
 }
 
 func (m *Model) helpLines() []string {
+	if m.app.Role == core.RoleStudent {
+		return helpLinesStudent()
+	}
+	return helpLinesTeacher()
+}
+
+func helpLinesTeacher() []string {
 	return []string{
 		"  ΓΕΝΙΚΕΣ ΣΥΝΤΟΜΕΥΣΕΙΣ",
-		"  Enter        αποστολή μηνύματος",
-		"  ^H           βοήθεια (αυτό το παράθυρο)",
-		"  ^A           browser αρχείων (Esc κλείσιμο)",
-		"  ^D           λήψη αρχείου  (@X.Y ή @fN στο πεδίο)",
-		"  ↑/↓          ιστορικό εντολών (bash-style)",
-		"  Tab          αυτόματη συμπλήρωση εντολής",
-		"  ^X / Esc     κλείσιμο overlay",
-		"  ^C           έξοδος",
+		"  Enter           αποστολή μηνύματος",
+		"  ^H              βοήθεια (αυτό το παράθυρο)",
+		"  ^A              browser αρχείων (Esc κλείσιμο)",
+		"  ^D              λήψη αρχείου  (@X.Y ή @fN στο πεδίο)",
+		"  ↑/↓             ιστορικό εντολών (bash-style) · scroll στο help",
+		"  Space / PgDn    επόμενη σελίδα στο help",
+		"  PgUp            προηγούμενη σελίδα στο help",
+		"  Tab             αυτόματη συμπλήρωση εντολής",
+		"  ^X / Esc        κλείσιμο overlay",
+		"  ^C              έξοδος",
 		"",
 		"  ΣΥΝΤΟΜΕΥΣΕΙΣ ΔΑΣΚΑΛΟΥ",
-		"  ^U    εμφάνιση/απόκρυψη λίστας μαθητών",
-		"  ^T    μενού εργαλείων          (^X κλείσιμο)",
-		"  ^G    Content (G)ate — μαύρη/λευκή λίστα  (^X κλείσιμο)",
-		"  ^L    κλείδωμα/ξεκλείδωμα οθονών (εναλλαγή)",
-		"  ^Z    σίγαση/κατάργηση σίγασης  (εναλλαγή)",
-		"  ^W    παρακολούθηση on/off (tvon/tvoff)",
-		"  ^S    casting on/off  (εναλλαγή)",
-		"  ^F    εστίαση παραθύρου σε μαθητή (πληκτρολόγησε τίτλο)",
-		"  ^N    Path (N)otes — αποθηκευμένα URL/αρχεία (^X κλείσιμο)",
-		"  ^P    καρφίτσωμα τελευταίου δικού σου μηνύματος",
-		"  ^A→^O αρχείο σε όλους + auto-open (μετά από ^A επιλογή)",
-		"  ^B    μαύρη λίστα             (@X.Y στο πεδίο)",
-		"  ^O    pass αναφοράς           (@X.Y στο πεδίο)",
+		"  ^U  λίστα μαθητών   ^T  εργαλεία   ^G  μαύρη/λευκή",
+		"  ^L  κλειδ./ξεκλ.    ^Z  σίγαση     ^W  παρακολούθηση",
+		"  ^S  casting         ^F  εστίαση    ^N  Path Notes",
+		"  ^P  καρφίτσωμα      ^B  μαύρη @X.Y ^O  pass @X.Y",
+		"  ^A→^O αρχείο σε όλους + auto-open",
+		"",
+		"  ΑΝΑΦΟΡΑ ΜΗΝΥΜΑΤΩΝ",
+		"  @X.Y  X=αποστολέας (0=εγώ, 1=πρώτος άλλος…)",
+		"        Y=θέση στο παράθυρο 1-10",
+		"  @pN   Nth καρφιτσωμένο μήνυμα (p1, p2…)",
+		"  @fN   Nth καρφιτσωμένο ΑΡΧΕΙΟ (f1, f2…)",
+		"",
+		"  ────────────────────────────────────────────",
+		"  ΕΝΤΟΛΕΣ ΕΡΓΑΛΕΙΩΝ   --t | --tool <action> [>N] [param]",
+		"  ────────────────────────────────────────────",
+		"  >N = σε μαθητή #N (από τη λίστα ^U) · χωρίς >N = όλοι",
+		"",
+		"  --t lk     / lock                  🔒 κλείδωμα οθόνης",
+		"  --t ulk    / unlock                🔓 ξεκλείδωμα",
+		"      π.χ.  --t lk          (όλοι)",
+		"            --t lk >3       (μόνο μαθητή #3)",
+		"  --t mu     / mute                  🔇 σίγαση",
+		"  --t umu    / unmute                🔊 κατάργηση σίγασης",
+		"  --t sh     / shot       [>N]       📷 στιγμιότυπο",
+		"      π.χ.  --t sh         (στιγμιότυπο όλων)",
+		"            --t sh >2      (μόνο μαθητή #2)",
+		"  --t tvon   / start-monitoring      👁 παρακολούθηση on",
+		"  --t tvoff  / stop-monitoring       👁 παρακολούθηση off",
+		"  --t cast   / start-casting         📡 casting on (caston επίσης)",
+		"  --t castoff/ stop-casting          📡 casting off",
+		"  --t bl     / block                 🚫 αποκλεισμός chat",
+		"  --t ubl    / unblock               ✅ αποδέσμευση chat",
+		"  --t cl     / close                 ❌ κλείσιμο εφαρμογών",
+		"  --t sd     / shutdown              ⚡ τερματισμός PC",
+		"  --t fc     / focus    <τίτλος>     🔍 εστίαση παραθύρου εφαρμογής",
+		"      π.χ.  --t fc Notepad           (φέρνει Notepad μπροστά σε όλους)",
+		"            --t fc >2 Chrome         (στον μαθητή #2)",
+		"  --t ln     / launch   <exe>        🚀 εκκίνηση εφαρμογής",
+		"      π.χ.  --t ln notepad.exe       (σε όλους)",
+		"            --t ln >3 calc.exe       (στον μαθητή #3)",
+		"",
+		"  ────────────────────────────────────────────",
+		"  ΔΙΑΧΕΙΡΙΣΗ ΚΑΙ ΑΠΟΣΤΟΛΗ ΜΗΝΥΜΑΤΩΝ",
+		"  ────────────────────────────────────────────",
+		"  Παράμετροι: @X.Y = μήνυμα · @pN = pinned · @fN = pinned αρχείο",
+		"",
+		"  --pin                                  καρφίτσωμα τελευταίου δικού σου ^P",
+		"  --pin     @X.Y                         καρφίτσωμα συγκεκριμένου",
+		"  κείμενο --pin                          αποστολή + καρφίτσωμα",
+		"      π.χ.  --pin @0.1            (καρφίτσωμα του 1ου δικού μου)",
+		"            --pin @1.3            (καρφίτσωμα 3ου από τον 1ο μαθητή)",
+		"            Διαβάστε σελ.4 --pin  (στέλνει + καρφιτσώνει)",
+		"",
+		"  --upin / --unpin                       αποκαρφίτσωμα τελευταίου",
+		"  --upin / --unpin   @X.Y | @pN          αποκαρφίτσωμα συγκεκριμένου",
+		"      π.χ.  --upin @p1            (αποκαρφίτσωμα 1ου pinned)",
+		"            --upin @0.2           (αποκαρφίτσωμα 2ου δικού μου)",
+		"",
+		"  --cp / --copy      @X.Y                αντιγραφή στο clipboard",
+		"      π.χ.  --cp @1.2            (αντιγραφή 2ου του μαθητή #1)",
+		"            --cp @p1             (αντιγραφή 1ου pinned)",
+		"",
+		"  --op / --open      @X.Y | @fN          άνοιγμα URL/αρχείου             ^O",
+		"      π.χ.  --op @1.3            (άνοιγμα URL/αρχείου του μαθητή #1)",
+		"            --op @f1             (άνοιγμα 1ου pinned αρχείου)",
+		"",
+		"  --dl / --download  @X.Y | @fN          λήψη αρχείου                    ^D",
+		"  --dl / --download  *                   λήψη ΟΛΩΝ σε zip (Downloads/)",
+		"      π.χ.  --dl @1.2            (λήψη του 2ου από τον μαθητή #1)",
+		"            --dl @f2             (λήψη 2ου pinned αρχείου)",
+		"            --dl *               (όλα μαζί σε zip)",
+		"",
+		"  --a / --attach                         file picker (ίδιο με ^A)",
+		"  --a / --attach     <path>              επισύναψη αρχείου",
+		"      π.χ.  --a C:\\notes\\paper.pdf",
+		"",
+		"  --rm / --del | --delete    @X.Y        διαγραφή μηνύματος",
+		"      π.χ.  --rm @2.1            (διαγραφή 1ου μηνύματος του μαθητή #2)",
+		"",
+		"  --clr / --clear                        διαγραφή όλου του chat",
+		"  --clr / --clear    @s                  καθαρισμός μηνυμάτων συστήματος",
+		"      π.χ.  --clr @s             (κρατάει chat, σβήνει τα γκρι system)",
+		"",
+		"  --ps / --pass      @X.Y                pass αναφοράς                   ^O",
+		"      π.χ.  --ps @3.2            (pass της αναφοράς του μαθητή #3)",
+		"",
+		"  --rep / --report   @X.Y                αναφορά μηνύματος",
+		"      π.χ.  --rep @1.4            (αναφορά 4ου μηνύματος του μαθητή #1)",
+		"",
+		"  PUSH-OPEN  (silent, χωρίς μήνυμα στο chat)",
+		"  --op / --open  <url>    >N | >*        άνοιγμα URL σε μαθητή/όλους",
+		"  --op / --open  @X.Y     >N             push αρχείου/URL → μαθητής",
+		"  <url> --op     [>N]                    shorthand: push URL",
+		"  --op / --open  this  >* | >N           (με 📎 staged) αποστολή + auto-open",
+		"      π.χ.  --op https://wikipedia.org >*    (URL σε όλους)",
+		"            --op https://example.com >2     (μόνο μαθητής #2)",
+		"            https://yt.com --op             (shorthand σε όλους)",
+		"            https://yt.com --op >3          (shorthand μαθητή #3)",
+		"            --op @f1 >2                     (push pinned αρχείου)",
+		"            --op this >*                    (📎 staged σε όλους + auto-open)",
+		"",
+		"  PATH NOTES  (^N για το παράθυρο)",
+		"  --pa / --path  [open]                  άνοιγμα Path Notes",
+		"  --pa / --path  save    <url|path>      αποθήκευση",
+		"  --pa / --path  delete  <ακριβής>       αφαίρεση εγγραφής",
+		"      π.χ.  --pa save https://docs.gov/intro",
+		"            --pa save C:\\school\\worksheet.pdf",
+		"            --pa delete https://docs.gov/intro",
+		"",
+		"  ────────────────────────────────────────────",
+		"  ΦΙΛΤΡΑΡΙΣΜΑ ΠΕΡΙΕΧΟΜΕΝΟΥ",
+		"  ────────────────────────────────────────────",
+		"  Παράμετροι: @X.Y = μήνυμα · @BN = blacklist entry · @WN = whitelist entry",
+		"",
+		"  --blk / --black    @X.Y                μαύρη λίστα + διαγραφή           ^B",
+		"  --blk / --black    <λέξεις>            προσθήκη στη μαύρη λίστα",
+		"  --blk / --black    @BN                 αφαίρεση @BN από μαύρη λίστα",
+		"      π.χ.  --blk @2.1                  (παίρνει λέξεις του μηνύματος, σβήνει)",
+		"            --blk βρισιά1 βρισιά2       (προσθήκη πολλαπλών λέξεων)",
+		"            --blk @B5                    (αφαίρεση 5ης εγγραφής μαύρης)",
+		"",
+		"  --wh / --white     <λέξεις>            προσθήκη στη λευκή λίστα",
+		"  --wh / --white     @WN                 αφαίρεση @WN από λευκή λίστα",
+		"      π.χ.  --wh αξιολόγηση κριτική     (επιτρέπεται παρά τη μαύρη)",
+		"            --wh @W3                    (αφαίρεση 3ης εγγραφής λευκής)",
+		"",
+		"  ^G    άνοιγμα overlay μαύρης/λευκής (βλέπεις τα @BN/@WN ids)",
+		"",
+		"  ────────────────────────────────────────────",
+		"  ΡΥΘΜΙΣΕΙΣ  --set <key> <τιμή>",
+		"  ────────────────────────────────────────────",
+		"  --set  nickname     <όνομα>            αλλαγή ονόματος",
+		"  --set  autostart    on | off           εκκίνηση με Windows",
+		"  --set  list import  <αρχείο>           εισαγωγή λιστών",
+		"  --set  list export  [αρχείο]           εξαγωγή λιστών (προεπ: Downloads/)",
+		"      π.χ.  --set nickname Κυρία Νίκη",
+		"            --set autostart on",
+		"            --set list import C:\\Users\\Νίκη\\Downloads\\lists.json",
+		"            --set list export                    (στο Downloads/)",
+		"",
+		"  ────────────────────────────────────────────",
+		"  TAB COMPLETION",
+		"  ────────────────────────────────────────────",
+		"  --h help (πάντα --h)   ·   όλα τα άλλα 2 γράμματα σε στυλ Linux",
+		"  Tab: h→--help · cp/c→--copy · op/o→--open · dl/d→--download",
+		"       a→--attach · p→--pin · u→--upin · r→--report · s→--set",
+		"       t→--t   ·   --t <Tab> κύκλος ενεργειών",
+		"  --set <Tab> κύκλος ρυθμίσεων: nickname / autostart / list",
+	}
+}
+
+func helpLinesStudent() []string {
+	return []string{
+		"  ΓΕΝΙΚΕΣ ΣΥΝΤΟΜΕΥΣΕΙΣ",
+		"  Enter           αποστολή μηνύματος",
+		"  ^H              βοήθεια (αυτό το παράθυρο)",
+		"  ^A              browser αρχείων (Esc κλείσιμο)",
+		"  ^D              λήψη αρχείου  (@X.Y ή @fN στο πεδίο)",
+		"  ↑/↓             ιστορικό εντολών (bash-style) · scroll στο help",
+		"  Space / PgDn    επόμενη σελίδα στο help",
+		"  PgUp            προηγούμενη σελίδα στο help",
+		"  Tab             αυτόματη συμπλήρωση εντολής",
+		"  ^X / Esc        κλείσιμο overlay",
+		"  ^C              έξοδος",
 		"",
 		"  ΣΥΝΤΟΜΕΥΣΕΙΣ ΜΑΘΗΤΗ",
 		"  ^R    αναφορά μηνύματος       (@X.Y στο πεδίο)",
@@ -1282,83 +1503,53 @@ func (m *Model) helpLines() []string {
 		"  @pN   Nth καρφιτσωμένο μήνυμα (p1, p2…)",
 		"  @fN   Nth καρφιτσωμένο ΑΡΧΕΙΟ (f1, f2…)",
 		"",
-		"  ΕΝΤΟΛΕΣ (ΟΛΟΙ)",
-		"  --cp  / --copy    @X.Y    αντιγραφή στο clipboard",
-		"  --op  / --open    @X.Y    άνοιγμα URL ή αρχείου        ^O (μαθητής)",
-		"  --op  / --open    @fN     άνοιγμα καρφιτσωμένου αρχείου",
-		"  --dl  / --download @X.Y   λήψη αρχείου                 ^D",
-		"  --dl  / --download @fN    λήψη καρφιτσωμένου αρχείου",
-		"  --a   / --attach          άνοιγμα file picker  (ίδιο με ^A)",
-		"  --a   / --attach  <path>  επισύναψη αρχείου απευθείας",
-		"  --clr @s                  καθαρισμός μηνυμάτων συστήματος",
+		"  ────────────────────────────────────────────",
+		"  ΔΙΑΧΕΙΡΙΣΗ ΚΑΙ ΑΠΟΣΤΟΛΗ ΜΗΝΥΜΑΤΩΝ",
+		"  ────────────────────────────────────────────",
+		"  Παράμετροι: @X.Y = μήνυμα · @pN = pinned · @fN = pinned αρχείο",
 		"",
-		"  ΕΝΤΟΛΕΣ ΜΑΘΗΤΗ",
-		"  --rep / --report @X.Y        αναφορά μηνύματος       ^R",
-		"  --set nickname <όνομα>       αλλαγή ονόματος στο chat",
-		"  --set autostart on|off       εκκίνηση με Windows",
-		"  --set list import <αρχείο>   εισαγωγή λιστών (παλιά & νέα μορφή)",
-		"  --set list export [αρχείο]   εξαγωγή λιστών (προεπ: Downloads/)",
-		"  --cast                       επαναφορά παραθύρου casting",
+		"  --rep / --report   @X.Y                αναφορά μηνύματος               ^R",
+		"      π.χ.  --rep @0.3            (αναφορά 3ου δικού μου)",
+		"            --rep @1.2            (αναφορά 2ου του δασκάλου)",
 		"",
-		"  ΕΝΤΟΛΕΣ ΔΑΣΚΑΛΟΥ",
-		"  --pin              καρφίτσωμα τελευταίου δικού σου  ^P",
-		"  --pin @X.Y         καρφίτσωμα συγκεκριμένου",
-		"  κείμενο --pin      αποστολή και καρφίτσωμα",
-		"  --upin / --unpin              αποκαρφίτσωμα τελευταίου",
-		"  --upin / --unpin  @X.Y        αποκαρφίτσωμα συγκεκριμένου",
-		"  --pass / --ps     @X.Y        pass αναφοράς            ^O",
-		"  --black / --blk   @X.Y        μαύρη λίστα + διαγραφή  ^B",
-		"  --blk  <λέξεις>               προσθήκη στη μαύρη λίστα",
-		"  --blk  @BN                    αφαίρεση @BN από μαύρη λίστα",
-		"  --wh   <λέξεις>               προσθήκη στη λευκή λίστα",
-		"  --wh   @WN                    αφαίρεση @WN από λευκή λίστα",
-		"  --del / --rem / --delete @X.Y  διαγραφή μηνύματος",
-		"  --clr / --clear               διαγραφή όλου του chat",
-		"  --dl  / --download *          λήψη ΟΛΩΝ αρχείων σε zip (Downloads/)",
+		"  --cp / --copy      @X.Y                αντιγραφή στο clipboard",
+		"      π.χ.  --cp @1.4             (αντιγραφή 4ου του δασκάλου)",
+		"            --cp @p1              (αντιγραφή 1ου pinned)",
 		"",
-		"  PUSH-OPEN (δάσκαλος — silent, χωρίς μήνυμα στο chat)",
-		"  --op / --open <url> >N    άνοιγμα URL στον μαθητή #N",
-		"  --op / --open <url> >*    άνοιγμα URL σε όλους",
-		"  --op / --open @X.Y >N     push αρχείου/URL → μαθητής #N",
-		"  <url> --op                push URL σε όλους (shorthand)",
-		"  <url> --op >N             push URL σε μαθητή #N",
-		"  --op this >* | >N         (με 📎 staged) αποστολή + auto-open",
+		"  --op / --open      @X.Y | @fN          άνοιγμα URL/αρχείου             ^O",
+		"      π.χ.  --op @1.2             (άνοιγμα URL/αρχείου του δασκάλου)",
+		"            --op @f1              (άνοιγμα 1ου pinned αρχείου)",
 		"",
-		"  PATH NOTES (δάσκαλος — ^N για το παράθυρο)",
-		"  --pa | --path | --path open       άνοιγμα Path Notes",
-		"  --path save   <url-ή-διαδρομή>    αποθήκευση (ανεβαίνει στην κορυφή)",
-		"  --path delete <ακριβής-τιμή>      αφαίρεση εγγραφής",
+		"  --dl / --download  @X.Y | @fN          λήψη αρχείου                    ^D",
+		"      π.χ.  --dl @1.3             (λήψη αρχείου του δασκάλου)",
+		"            --dl @f2              (λήψη 2ου pinned αρχείου)",
 		"",
-		"  ΕΡΓΑΛΕΙΑ  --t / --tool <εντολή> [>N] [param]  (Tab: κύκλος εντολών)",
-		"  lock / unlock          κλείδωμα/ξεκλείδωμα οθόνης",
-		"  mute / unmute          σίγαση/ακύρωση σίγασης",
-		"  tvon / start-monitoring    παρακολούθηση on",
-		"  tvoff / stop-monitoring    παρακολούθηση off",
-		"  shot  [>N]                 στιγμιότυπο (όλοι ή ένας)",
-		"  start-casting / cast / caston   casting on  (^S εναλλαγή)",
-		"  stop-casting / castoff          casting off (^S εναλλαγή)",
-		"  block / unblock        αποκλεισμός/αποδέσμευση chat",
-		"  close                  κλείσιμο εφαρμογών",
-		"  shutdown               τερματισμός PC",
-		"  focus <τίτλος>         εστίαση εφαρμογής",
-		"  launch <exe>           εκκίνηση εφαρμογής",
-		"  >N = αποστολή στον μαθητή #N · (χωρίς >N) = όλοι",
+		"  --a / --attach                         file picker (ίδιο με ^A)",
+		"  --a / --attach     <path>              επισύναψη αρχείου",
+		"      π.χ.  --a C:\\school\\εργασία.pdf",
 		"",
-		"  TAB COMPLETION (στο πεδίο γραφής)",
-		"  h/--h → --help      d/--d → --download   o/--o → --open",
-		"  a/--a → --attach    p/--p → --pin         r/--r → --report",
-		"  c/--c → --copy      u/--u → --unpin       t → --t",
-		"  s/--s → --set       --t <Tab>  κύκλος εντολών: lock unlock mute…",
-		"  --set <Tab>  κύκλος ρυθμίσεων: nickname autostart list",
+		"  --clr / --clear    @s                  καθαρισμός μηνυμάτων συστήματος",
+		"      π.χ.  --clr @s              (κρατάει chat, σβήνει τα γκρι system)",
 		"",
-		"  Παραδείγματα:",
-		"  Διαβάστε σελ.4 --pin",
-		"  --t lock >2               κλείδωμα μαθητή #2",
-		"  --t launch >3 notepad.exe   εκκίνηση σε μαθητή #3",
-		"  --op @f1      άνοιγμα 1ου καρφιτσωμένου αρχείου",
-		"  --dl @f2      λήψη 2ου καρφιτσωμένου αρχείου",
-		"  --cp @p1      αντιγραφή 1ου καρφιτσωμένου",
-		"  --upin @p2    αποκαρφίτσωμα 2ου",
+		"  ────────────────────────────────────────────",
+		"  ΡΥΘΜΙΣΕΙΣ  --set <key> <τιμή>",
+		"  ────────────────────────────────────────────",
+		"  --set  nickname     <όνομα>            αλλαγή ονόματος",
+		"  --set  autostart    on | off           εκκίνηση με Windows",
+		"  --set  list import  <αρχείο>           εισαγωγή λιστών",
+		"  --set  list export  [αρχείο]           εξαγωγή λιστών (προεπ: Downloads/)",
+		"  --cast                                 επαναφορά παραθύρου casting",
+		"      π.χ.  --set nickname Νίκη",
+		"            --set autostart on",
+		"            --set list import C:\\Users\\Νίκη\\Downloads\\lists.json",
+		"            --set list export             (στο Downloads/)",
+		"",
+		"  ────────────────────────────────────────────",
+		"  TAB COMPLETION",
+		"  ────────────────────────────────────────────",
+		"  --h help (πάντα --h)   ·   όλα τα άλλα 2 γράμματα σε στυλ Linux",
+		"  Tab: h→--help · c→--copy · o→--open · d→--download",
+		"       a→--attach · r→--report · s→--set",
 	}
 }
 
@@ -2979,11 +3170,14 @@ var tabCompletions = []struct{ prefix, full string }{
 // setSubcommands is the ordered list cycled when Tab is pressed after "--set ".
 var setSubcommands = []string{"nickname", "autostart", "list"}
 
-// toolNames is the ordered list of --t tool keywords cycled by Tab.
+// toolNames is the ordered list of --t keywords cycled by Tab. One canonical
+// name per action — duplicates (long forms vs short aliases, start-monitoring
+// vs tvon, etc.) just bloat the cycle without adding discoverability. Shorts
+// still work at runtime; users who know them type them directly.
 var toolNames = []string{
 	"lock", "unlock", "mute", "unmute", "shot",
 	"close", "shutdown", "block", "unblock", "focus", "launch",
-	"tvon", "tvoff", "start-casting", "stop-casting", "cast", "caston", "castoff",
+	"tvon", "tvoff", "cast", "castoff",
 }
 
 func (m *Model) doTabComplete() {
@@ -3096,23 +3290,128 @@ var knownCmdTokens = map[string]bool{
 	"--pass": true, "--ps": true,
 	"--black": true, "--blk": true,
 	"--white": true, "--wh": true,
-	"--del": true, "--rem": true, "--delete": true,
+	"--rm": true, "--del": true, "--rem": true, "--delete": true,
 	"--clr": true, "--clear": true,
 	"--t": true, "--tool": true,
 	"--send": true,
-	"--set": true,
+	"--set":  true,
 	"--cast": true,
-	"--mon": true, "--monitor": true,
-	"--log":  true,
-	"--pa":   true, "--path": true,
+	"--mon":  true, "--monitor": true,
+	"--log": true,
+	"--pa":  true, "--path": true,
 }
 
-// looksLikeCommand returns true when any whitespace-separated token exactly
-// matches a known command keyword.  "--ata" is NOT a command; "--a" is.
+// toolActionNames is the canonical set of valid --t actions. Used both for
+// Tab cycling and for prefix-validation of partial input ("--t loc" → still a
+// prefix of "lock", so blue; "--t locc" → not, so plain).
+var toolActionNames = []string{
+	"lk", "lock", "ulk", "unlock",
+	"mu", "mute", "umu", "unmute",
+	"sh", "shot",
+	"cl", "close", "sd", "shutdown",
+	"bl", "block", "ubl", "unblock",
+	"fc", "focus", "ln", "launch",
+	"tvon", "tvoff", "start-monitoring", "stop-monitoring",
+	"start-casting", "cast", "caston", "stop-casting", "castoff",
+}
+
+// looksLikeCommand returns true when the input is currently a syntactically
+// valid command — or a valid prefix of one. The first `--xxx` token in the
+// text is treated as the command head; tokens before it are free text
+// (e.g. "Διαβάστε σελ.4 --pin" is still a command).
+//
+// For commands with a known sub-grammar (--t, --set) the args are validated
+// too: "--t loc" stays blue (prefix of "lock"), "--t locc" turns plain.
 func looksLikeCommand(text string) bool {
-	for _, tok := range strings.Fields(text) {
-		if knownCmdTokens[tok] {
+	tokens := strings.Fields(text)
+	for i, tok := range tokens {
+		if !strings.HasPrefix(tok, "--") {
+			continue
+		}
+		return validateCmdHead(tokens[i:])
+	}
+	return false
+}
+
+// validateCmdHead checks that `toks[0]` is a known --command (or a prefix of
+// one) and that any following tokens fit the command's grammar.
+func validateCmdHead(toks []string) bool {
+	if len(toks) == 0 {
+		return false
+	}
+	cmd := toks[0]
+	if knownCmdTokens[cmd] {
+		return validateCmdArgs(cmd, toks[1:])
+	}
+	// Partial command head — accept only if it's a strict prefix of a known
+	// command and nothing has been typed after it yet.
+	if len(toks) == 1 && isCmdPrefix(cmd) {
+		return true
+	}
+	return false
+}
+
+func isCmdPrefix(s string) bool {
+	if !strings.HasPrefix(s, "--") || len(s) < 3 {
+		return false
+	}
+	for k := range knownCmdTokens {
+		if len(k) > len(s) && strings.HasPrefix(k, s) {
 			return true
+		}
+	}
+	return false
+}
+
+// validateCmdArgs validates the args of a fully-typed --command. Permissive
+// for commands without an enumerable grammar (--pin, --open, --download…).
+func validateCmdArgs(cmd string, rest []string) bool {
+	switch cmd {
+	case "--t", "--tool":
+		return validateToolArgs(rest)
+	case "--set":
+		return validateSetArgs(rest)
+	default:
+		return true
+	}
+}
+
+func validateToolArgs(rest []string) bool {
+	if len(rest) == 0 {
+		return true
+	}
+	action := rest[0]
+	for _, a := range toolActionNames {
+		if a == action {
+			return true // full action: any further tokens (>N, params) accepted
+		}
+	}
+	// Partial action — only valid if it's the last token typed.
+	if len(rest) == 1 {
+		for _, a := range toolActionNames {
+			if strings.HasPrefix(a, action) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validateSetArgs(rest []string) bool {
+	if len(rest) == 0 {
+		return true
+	}
+	key := rest[0]
+	for _, k := range setSubcommands {
+		if k == key {
+			return true
+		}
+	}
+	if len(rest) == 1 {
+		for _, k := range setSubcommands {
+			if strings.HasPrefix(k, key) {
+				return true
+			}
 		}
 	}
 	return false
@@ -3224,6 +3523,15 @@ func (m *Model) handleSet(args string) {
 	} else {
 		setting = strings.ToLower(args[:spaceIdx])
 		rest = strings.TrimSpace(args[spaceIdx+1:])
+	}
+	// Short-form aliases
+	switch setting {
+	case "nick":
+		setting = "nickname"
+	case "auto":
+		setting = "autostart"
+	case "ls":
+		setting = "list"
 	}
 
 	switch setting {

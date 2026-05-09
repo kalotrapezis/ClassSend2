@@ -14,6 +14,36 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.1.0] — 2026-05-09
+
+The "command surface cleanup" release. After several months of patch-level fixes (0.0.4 through 0.0.9) the command vocabulary had grown faster than the help could keep up, and the syntax-highlighter was being permissive enough that typos like `--t locc` still rendered blue. This release tightens the input UX, gives every parameterised command a worked example in the help, and bumps to 0.1.0 because the user-visible command surface changed in a coherent way (no protocol changes, no breakage of existing typed commands).
+
+### Added
+
+- **Linux-style short forms for `--t` actions** ([internal/tui/model.go](internal/tui/model.go) `actions` map). Every tool action now accepts a 2-3 letter short alongside its full form: `lk/lock`, `ulk/unlock`, `mu/mute`, `umu/unmute`, `sh/shot`, `cl/close`, `sd/shutdown`, `bl/block`, `ubl/unblock`, `fc/focus`, `ln/launch`. The pre-existing `tvon/start-monitoring`, `tvoff/stop-monitoring`, `cast|caston/start-casting`, `castoff/stop-casting` pairings are unchanged.
+- **`--rm` as Linux-convention alias for delete** alongside the pre-existing `--del / --rem / --delete`. Matches user mental model — anyone coming from a shell types `rm` first.
+- **Worked examples in `^H` help, per parameterised command.** Every command that takes an argument now shows 1-3 concrete `π.χ.` lines underneath the syntax row, covering the common cases. Most useful at 8 a.m. when a teacher is looking up `--blk @BN` form for the first time in a week.
+- **Page-down with Space / PgDn in `^H` help and `^V` about overlays** ([internal/tui/model.go](internal/tui/model.go) `handleKey`). The help is now ~150 lines for the teacher; ↑/↓ still scroll line-by-line, but Space advances 20 lines (one page with 2 lines of overlap). PgUp pages back. Hint added to the ΓΕΝΙΚΕΣ ΣΥΝΤΟΜΕΥΣΕΙΣ section so teachers see it immediately.
+- **Role-aware help** ([internal/tui/model.go](internal/tui/model.go) `helpLines` → `helpLinesTeacher` / `helpLinesStudent`). Students no longer see teacher-only sections (tools, push-open, content filtering, path notes). Their help is half the size and shows only commands they can actually use.
+
+### Changed
+
+- **Input syntax highlighting is now grammar-aware** ([internal/tui/model.go](internal/tui/model.go) `looksLikeCommand` + new `validateCmdHead` / `validateToolArgs` / `validateSetArgs`). Previously any line containing a token starting with `--` rendered the whole input blue, including obvious typos like `--t locc` or `--xx`. Now the validator walks the tokens left-to-right: the first `--xxx` must be a known command (or a strict prefix of one), and subsequent tokens must fit the command's grammar where one is enumerable (`--t <action>`, `--set <key>`). Other commands stay permissive (no point validating `@X.Y` references at colour time). Concretely: `--t loc` stays blue (prefix of `lock`), `--t locc` turns plain; `--set ni` stays blue, `--set xx` plain; `--he` blue, `--xx` plain. Free text before the first `--xxx` token is unaffected (so `Διαβάστε σελ.4 --pin` still highlights correctly).
+- **Help structured by category** rather than by role-of-action. Sections are now ΕΝΤΟΛΕΣ ΕΡΓΑΛΕΙΩΝ / ΔΙΑΧΕΙΡΙΣΗ ΚΑΙ ΑΠΟΣΤΟΛΗ ΜΗΝΥΜΑΤΩΝ / ΦΙΛΤΡΑΡΙΣΜΑ ΠΕΡΙΕΧΟΜΕΝΟΥ / ΡΥΘΜΙΣΕΙΣ rather than the old "EVERYONE / STUDENT / TEACHER" split. Easier to find a command when you remember what it does but not who can run it.
+- **Help short-form column shows the canonical short**, not every Tab-aid prefix. So `--cp / --copy`, not `--c / --cp / --copy` — the row was getting too wide and the single-letter column was misleading anyway (`--c` doesn't execute, only Tab-expands). Short forms documented are exactly the ones that work when typed and Enter'd. `--h` is the only universal single-letter short.
+- **Tab cycling on `--t <Tab>`** now lists one canonical name per action ([toolNames](internal/tui/model.go)) rather than every alias. Long forms only (`lock`, `unlock`, `mute`, …) plus the actions where the "short" IS the canonical name (`tvon`, `tvoff`, `cast`, `castoff`). Adding the alphabetic shorts (`lk`, `ulk`, …) to the cycle would have doubled the list without any discoverability gain — anyone who knows `lk` types it directly.
+
+### Fixed
+
+- **`--t start<Tab>` now cycles between `start-monitoring` and `start-casting`.** Was a long-standing oversight: only `start-casting` was in `toolNames`, so `start-monitoring` was reachable only by typing the `tvon` alias. Both are present now.
+
+### Notes
+
+- **No protocol changes.** v0.1.0 teacher and v0.0.9 students (or vice-versa) inter-operate normally. Every typed command that worked before still works — this release only added aliases, never removed any.
+- **No installer-side changes.** `setup/classsend2.iss` is untouched apart from the version bump. The teacher / student / dev role matrix is identical to v0.0.9.
+
+---
+
 ## [0.0.9] — 2026-05-09
 
 The "actually fix the black thumbnails" release. After a long session of testing on a real Win10 hybrid-graphics laptop (i7-7500U + Intel HD 620 + AMD Radeon 530) we found and fixed three independent bugs that had been compounding to make the monitoring grid look broken on certain PCs. Plus an architectural rewrite of the monitoring poll loop that decouples "asking" from "receiving" — slow PCs no longer drop their frames just because we'd already moved on to the next one.
