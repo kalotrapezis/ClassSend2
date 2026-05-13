@@ -73,6 +73,12 @@ type Model struct {
 	favoritesCursor int
 	favoritesScroll int
 
+	// Scheduled-commands overlay (^X). Shows the same jobs as `--sched` but
+	// in a navigable panel with per-row cancel.
+	schedOpen   bool
+	schedCursor int
+	schedScroll int
+
 	listOpen   bool
 	listScroll int
 
@@ -254,6 +260,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	helpWasOpen       := m.helpOpen       // same guard for help overlay
 	aboutWasOpen      := m.aboutOpen      // same guard for about overlay
 	favoritesWasOpen  := m.favoritesOpen  // same guard for favorites overlay
+	schedWasOpen      := m.schedOpen      // same guard for scheduled-commands overlay
 	listWasOpen       := m.listOpen       // same guard for list overlay
 
 	switch msg := msg.(type) {
@@ -354,7 +361,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Forward remaining key events to input only when focused and no overlay is open.
 	// Enter is never forwarded — it's the send key, not a newline, and would leave a
 	// blank line in the textarea after Reset() clears the value.
-	noOverlay := !m.toolsOpen && !toolsWereOpen && !m.filePickerOpen && !filePickerWasOpen && !m.helpOpen && !helpWasOpen && !m.aboutOpen && !aboutWasOpen && !m.favoritesOpen && !favoritesWasOpen && !m.listOpen && !listWasOpen
+	noOverlay := !m.toolsOpen && !toolsWereOpen && !m.filePickerOpen && !filePickerWasOpen && !m.helpOpen && !helpWasOpen && !m.aboutOpen && !aboutWasOpen && !m.favoritesOpen && !favoritesWasOpen && !m.schedOpen && !schedWasOpen && !m.listOpen && !listWasOpen
 	isEnter := func() bool {
 		k, ok := msg.(tea.KeyMsg)
 		if !ok {
@@ -543,6 +550,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.favoritesScroll = 0
 		}
 
+	case "ctrl+x":
+		// ^X opens the scheduled-commands panel — every pending `--t … | …`
+		// job. Teacher-only since only the teacher schedules. Toggles open
+		// when no other overlay is up; closes itself if already open. `d` /
+		// Delete cancels the highlighted row; ↑↓ navigate; Esc closes.
+		if m.app.Role == core.RoleTeacher && m.screen == screenChat {
+			if m.schedOpen {
+				m.schedOpen = false
+			} else if !m.listOpen && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.filePickerOpen && !m.toolsOpen {
+				m.schedOpen = true
+				m.schedCursor = 0
+				m.schedScroll = 0
+			}
+		}
+
 	case "ctrl+b":
 		if m.app.Role == core.RoleTeacher && m.screen == screenChat {
 			return m.shortcutAction("black")
@@ -571,7 +593,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return m.shortcutAction("op")
 		}
 
-	case "esc", "ctrl+x":
+	case "esc":
 		if m.listOpen {
 			m.listOpen = false
 		} else if m.helpOpen {
@@ -580,6 +602,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.aboutOpen = false
 		} else if m.favoritesOpen {
 			m.favoritesOpen = false
+		} else if m.schedOpen {
+			m.schedOpen = false
 		} else if m.filePickerOpen {
 			m.filePickerOpen = false
 		} else if m.stagedFile != "" {
@@ -612,6 +636,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.favoritesCursor--
 				if m.favoritesCursor < m.favoritesScroll {
 					m.favoritesScroll = m.favoritesCursor
+				}
+			}
+		} else if m.schedOpen {
+			if m.schedCursor > 0 {
+				m.schedCursor--
+				if m.schedCursor < m.schedScroll {
+					m.schedScroll = m.schedCursor
 				}
 			}
 		} else if m.filePickerOpen {
@@ -657,6 +688,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				const maxVis = 18
 				if m.favoritesCursor >= m.favoritesScroll+maxVis {
 					m.favoritesScroll = m.favoritesCursor - maxVis + 1
+				}
+			}
+		} else if m.schedOpen {
+			n := len(m.app.Sched.List())
+			if m.schedCursor < n-1 {
+				m.schedCursor++
+				const maxVis = 14
+				if m.schedCursor >= m.schedScroll+maxVis {
+					m.schedScroll = m.schedCursor - maxVis + 1
 				}
 			}
 		} else if m.filePickerOpen {
@@ -724,14 +764,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case "k":
-		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.filePickerOpen && !m.toolsOpen {
+		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.schedOpen && !m.filePickerOpen && !m.toolsOpen {
 			if m.selectedSt > 0 {
 				m.selectedSt--
 			}
 		}
 
 	case "j":
-		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.filePickerOpen && !m.toolsOpen {
+		if !m.focusInput && !m.helpOpen && !m.aboutOpen && !m.favoritesOpen && !m.schedOpen && !m.filePickerOpen && !m.toolsOpen {
 			if m.selectedSt < len(m.students)-1 {
 				m.selectedSt++
 			}
@@ -739,10 +779,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	case "d", "delete":
 		// Inside the favorites overlay, 'd' (or Delete) removes the highlighted
-		// entry. Outside the overlay this falls through to the input field as
-		// a normal letter, so tying chat won't trigger anything.
+		// entry. Inside the sched overlay, the same key cancels the highlighted
+		// scheduled job. Outside any overlay this falls through to the input
+		// field as a normal letter.
 		if m.favoritesOpen {
 			m.favoritesDeleteSelected()
+			return nil
+		}
+		if m.schedOpen {
+			m.schedCancelSelected()
 			return nil
 		}
 
@@ -1621,7 +1666,7 @@ func helpLinesTeacher() []string {
 		"  ^L  κλειδ./ξεκλ.    ^Z  σίγαση     ^W  παρακολούθηση",
 		"  ^S  casting         ^F  εστίαση    ^N  Path Notes",
 		"  ^P  καρφίτσωμα      ^B  μαύρη @X.Y ^O  pass @X.Y",
-		"  ^A→^O αρχείο σε όλους + auto-open",
+		"  ^X  προγραμματισμένες εντολές    ^A→^O αρχείο + auto-open",
 		"",
 		"  ΑΝΑΦΟΡΑ ΜΗΝΥΜΑΤΩΝ",
 		"  @X.Y  X=αποστολέας (0=εγώ, 1=πρώτος άλλος…)",
@@ -1669,7 +1714,9 @@ func helpLinesTeacher() []string {
 		"  Αν η HH:MM έχει περάσει σήμερα, ζητείται επιβεβαίωση (--y / --n)",
 		"  για να προγραμματιστεί την επόμενη μέρα.",
 		"",
-		"  --sched                              λίστα προγραμματισμένων εντολών",
+		"  ^X                                   panel με όλες τις προγραμματισμένες",
+		"      (μέσα στο panel: ↑↓ επιλογή · d ακύρωση · Esc κλείσιμο)",
+		"  --sched                              λίστα ως system messages",
 		"  --sched cancel <id>                  ακύρωση (π.χ. --sched cancel S1)",
 		"",
 		"  ────────────────────────────────────────────",
@@ -2093,6 +2140,93 @@ func (m *Model) favoritesPlaceSelected() {
 	m.focusInput = true
 }
 
+// overlayScheduled renders the ^X panel: every pending scheduled command,
+// newest-first by fire time, with countdown. 'd' / Delete cancels the
+// highlighted row; ↑↓ navigate; Esc closes.
+func (m *Model) overlayScheduled(base string) string {
+	const overlayW = 78
+	const maxVisible = 14
+
+	jobs := m.app.Sched.List()
+
+	var out []string
+	out = append(out, styleTitle.Render("  ⏰ (X)ρονοπρογραμματισμένες εντολές"))
+	out = append(out, strings.Repeat("─", overlayW))
+
+	if len(jobs) == 0 {
+		out = append(out, styleHint.Render("  (καμία προγραμματισμένη εντολή — προσθήκη με --t … | HH:MM ή | :λεπτά)"))
+	} else {
+		// Clamp cursor in case the list shrank.
+		if m.schedCursor >= len(jobs) {
+			m.schedCursor = len(jobs) - 1
+		}
+		if m.schedCursor < 0 {
+			m.schedCursor = 0
+		}
+		start := m.schedScroll
+		if start > len(jobs)-maxVisible {
+			start = len(jobs) - maxVisible
+		}
+		if start < 0 {
+			start = 0
+		}
+		end := start + maxVisible
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		for i := start; i < end; i++ {
+			j := jobs[i]
+			// Format: [S1]  🔒 Κλείδωμα → όλους · @ Wed 13:15 · σε 1ώ 22λ
+			line := fmt.Sprintf("  [%s]  %s → %s  ·  @ %s  ·  σε %s",
+				j.ID, j.Label, j.TargetText,
+				j.When.Format("Mon 15:04"),
+				humanDuration(time.Until(j.When)))
+			if len(line) > overlayW-2 {
+				line = line[:overlayW-2] + "…"
+			}
+			if i == m.schedCursor {
+				line = styleSelected.Width(overlayW).Render(line)
+			} else {
+				line = lipgloss.NewStyle().Width(overlayW).Foreground(colText).Render(line)
+			}
+			out = append(out, line)
+		}
+	}
+
+	out = append(out, strings.Repeat("─", overlayW))
+	hint := "[↑↓] επιλογή  [d] ακύρωση  [Esc] κλείσιμο"
+	out = append(out, styleHint.Render(hint))
+
+	panel := styleBorder.Padding(1, 2).Render(strings.Join(out, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+		panel,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(colBg),
+	)
+}
+
+// schedCancelSelected cancels the highlighted scheduled job and pushes a
+// confirmation message. Keeps the cursor in bounds afterwards.
+func (m *Model) schedCancelSelected() {
+	jobs := m.app.Sched.List()
+	if len(jobs) == 0 || m.schedCursor < 0 || m.schedCursor >= len(jobs) {
+		return
+	}
+	j := jobs[m.schedCursor]
+	if cancelled, ok := m.app.Sched.Cancel(j.ID); ok {
+		m.pushSysMsg(fmt.Sprintf("🗑 Ακυρώθηκε [%s] %s → %s @ %s",
+			cancelled.ID, cancelled.Label, cancelled.TargetText,
+			cancelled.When.Format("Mon 15:04")))
+	}
+	remaining := len(jobs) - 1
+	if m.schedCursor >= remaining {
+		m.schedCursor = remaining - 1
+	}
+	if m.schedCursor < 0 {
+		m.schedCursor = 0
+	}
+}
+
 // favoritesTogglePinSelected flips the Pinned flag on the highlighted entry.
 // Pinned entries float above non-pinned and survive the 50-entry cap.
 func (m *Model) favoritesTogglePinSelected() {
@@ -2309,6 +2443,9 @@ func (m *Model) viewChat() string {
 	}
 	if m.favoritesOpen {
 		view = m.overlayFavorites(view)
+	}
+	if m.schedOpen {
+		view = m.overlayScheduled(view)
 	}
 	if m.listOpen {
 		view = m.overlayList(view)
