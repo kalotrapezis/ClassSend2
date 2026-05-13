@@ -16,6 +16,20 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.1] — 2026-05-13
+
+Polish on top of 0.2.0. The monitoring window now has a one-line keyboard hint bar at the bottom of the grid so the new shortcuts are discoverable without opening help.
+
+### Added
+
+- **Bottom hint strip in `monitoring.exe`** ([cmd/monitoring/main.go](cmd/monitoring/main.go) `paintHintBar`). Renders `^F πλήρης οθόνη   ^T πάντα μπροστά   ^W διακοπή   Esc έξοδος   κλικ: εστίαση` centered in a 22 px strip at the bottom of the window. Visible in both grid and focus modes. Cells (and `hitTestCell`) automatically claim only `winH - hintBarH` so a click on the hint row doesn't accidentally focus a cell. On a window smaller than 44 px tall the bar self-suppresses — pathological case, but worth handling.
+
+### Notes
+
+- Single-file change; no protocol impact. Bumped purely to ship the hint bar with a clean version identity.
+
+---
+
 ## [0.2.0] — 2026-05-13
 
 The "lessons can plan ahead" release. Three threads landed together in one classroom-driven session: a scheduling system for tool commands, a system-load safe mode for the agent so an overloaded student PC stops dragging the rest of the grid down, and a handful of UX fixes the user spotted during a real lesson on 11 freshly-installed potato PCs.

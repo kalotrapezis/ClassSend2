@@ -427,11 +427,18 @@ func monitorWndProc(hwnd, msg, wParam, lParam uintptr) (ret uintptr) {
 }
 
 // hitTestCell returns the cell index at window coords (x,y), or -1 if the
-// click was on padding or outside the grid.
+// click was on padding or outside the grid. The bottom hintBarH strip is
+// reserved for the shortcut hint row and isn't part of any cell.
 func hitTestCell(hwnd uintptr, x, y int32) int {
 	var rc winRect
 	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
 	winW, winH := rc.Right, rc.Bottom
+	if winH > hintBarH {
+		winH -= hintBarH
+	}
+	if y >= winH {
+		return -1 // click landed on the hint bar
+	}
 
 	gridMu.RLock()
 	n := len(cells)
@@ -582,8 +589,13 @@ func paintGrid(hwnd uintptr) {
 	curFocus := focusIdx
 	focusMu.RUnlock()
 
-	// Focus mode: paint just the focused cell, full window.
+	// Focus mode: paint just the focused cell, full window minus the bottom
+	// hint strip.
 	if curFocus >= 0 && curFocus < len(snapshot) {
+		focusH := winH - hintBarH
+		if focusH < 0 {
+			focusH = winH
+		}
 		hFont, _, _ := procCreateFontW.Call(
 			i32(-14), 0, 0, 0,
 			600, 0, 0, 0,
@@ -592,7 +604,7 @@ func paintGrid(hwnd uintptr) {
 		)
 		origFont, _, _ := procSelectObject.Call(hdcMem, hFont)
 		procSetStretchBltMode.Call(hdcMem, uintptr(colorOnColor))
-		paintCell(hdcMem, 0, 0, winW, winH, &snapshot[curFocus])
+		paintCell(hdcMem, 0, 0, winW, focusH, &snapshot[curFocus])
 
 		// Top-right exit hint badge so the user knows how to leave focus mode.
 		hint := utf16("  Esc ή κλικ για έξοδο  ")
@@ -608,7 +620,16 @@ func paintGrid(hwnd uintptr) {
 
 		procSelectObject.Call(hdcMem, origFont)
 		procDeleteObject.Call(hFont)
+		paintHintBar(hdcMem, winW, winH)
 		return
+	}
+
+	// Reserve a strip at the bottom for the shortcut hint row. Cells get the
+	// remaining height; the bar paints last (after the grid) so the cells
+	// can't overdraw it.
+	gridH := winH - hintBarH
+	if gridH < 0 {
+		gridH = winH // tiny window — skip the bar so the grid stays useful
 	}
 
 	n := len(snapshot)
@@ -616,16 +637,17 @@ func paintGrid(hwnd uintptr) {
 		procSetBkMode.Call(hdcMem, uintptr(transparent))
 		procSetTextColor.Call(hdcMem, 0x00666666)
 		msg := utf16("Αναμονή σύνδεσης μαθητών...")
-		textRc := winRect{0, 0, winW, winH}
+		textRc := winRect{0, 0, winW, gridH}
 		procDrawTextW.Call(hdcMem, uintptr(unsafe.Pointer(msg)), ^uintptr(0),
 			uintptr(unsafe.Pointer(&textRc)), dtCenter|dtVcenter|dtSingleline)
+		paintHintBar(hdcMem, winW, winH)
 		return
 	}
 
 	cols := int32(math.Ceil(math.Sqrt(float64(n))))
 	rows := (int32(n) + cols - 1) / cols
 	cellW := winW / cols
-	cellH := winH / rows
+	cellH := gridH / rows
 
 	// Load shared font for student name labels
 	hFont, _, _ := procCreateFontW.Call(
@@ -653,6 +675,43 @@ func paintGrid(hwnd uintptr) {
 		ch := cellH - pad*2
 		paintCell(hdcMem, x, y, cw, ch, &cell)
 	}
+
+	paintHintBar(hdcMem, winW, winH)
+}
+
+// hintBarH is the height of the bottom shortcut-hint strip. Subtracted from
+// winH wherever the grid (or hit-test) computes a cell layout.
+const hintBarH = int32(22)
+
+// paintHintBar draws a single-line keyboard-shortcut hint at the bottom of
+// the window. Visible in both grid and focus mode (in focus mode the cell
+// fills winH, but the bar paints on top — fine because the bar is tiny and
+// the focus exit hint top-right is the more prominent cue).
+func paintHintBar(hdc uintptr, winW, winH int32) {
+	if winH < hintBarH*2 {
+		return // window too small to be useful — skip
+	}
+	barRc := winRect{0, winH - hintBarH, winW, winH}
+	bg, _, _ := procCreateSolidBrush.Call(0x00181818)
+	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&barRc)), bg)
+	procDeleteObject.Call(bg)
+
+	hFont, _, _ := procCreateFontW.Call(
+		i32(-12), 0, 0, 0,
+		400, 0, 0, 0,
+		1, 0, 0, 4, 0,
+		uintptr(unsafe.Pointer(utf16("Segoe UI"))),
+	)
+	origFont, _, _ := procSelectObject.Call(hdc, hFont)
+	procSetBkMode.Call(hdc, uintptr(transparent))
+	procSetTextColor.Call(hdc, 0x00888888)
+
+	hint := utf16("  ^F πλήρης οθόνη   ^T πάντα μπροστά   ^W διακοπή   Esc έξοδος   κλικ: εστίαση  ")
+	procDrawTextW.Call(hdc, uintptr(unsafe.Pointer(hint)), ^uintptr(0),
+		uintptr(unsafe.Pointer(&barRc)), dtCenter|dtVcenter|dtSingleline)
+
+	procSelectObject.Call(hdc, origFont)
+	procDeleteObject.Call(hFont)
 }
 
 func paintCell(hdc uintptr, x, y, w, h int32, cell *cellState) {
