@@ -16,6 +16,7 @@ import (
 type FavoriteEntry struct {
 	Value   string `json:"value"`
 	AddedAt int64  `json:"added_at"`
+	Pinned  bool   `json:"pinned,omitempty"`
 }
 
 const (
@@ -48,16 +49,82 @@ func (a *App) AddFavorite(value string) {
 	} else {
 		a.Favorites = append(a.Favorites, FavoriteEntry{Value: value, AddedAt: now})
 	}
-	// Sort newest-first, trim to cap
-	sort.SliceStable(a.Favorites, func(i, j int) bool {
-		return a.Favorites[i].AddedAt > a.Favorites[j].AddedAt
-	})
-	if len(a.Favorites) > favoritesMaxLen {
-		a.Favorites = a.Favorites[:favoritesMaxLen]
-	}
+	sortFavorites(a.Favorites)
+	a.Favorites = trimFavorites(a.Favorites)
 	snap := append([]FavoriteEntry(nil), a.Favorites...)
 	a.mu.Unlock()
 	go saveFavorites(a.DataDir, snap)
+}
+
+// sortFavorites orders entries: pinned first, then by AddedAt desc within each group.
+func sortFavorites(entries []FavoriteEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Pinned != entries[j].Pinned {
+			return entries[i].Pinned
+		}
+		return entries[i].AddedAt > entries[j].AddedAt
+	})
+}
+
+// trimFavorites enforces the cap while keeping every pinned entry. Pinned
+// entries are never evicted; non-pinned tail entries are dropped first. If the
+// pinned set alone exceeds the cap, all pinned entries are kept (cap is soft
+// w.r.t. pins).
+func trimFavorites(entries []FavoriteEntry) []FavoriteEntry {
+	if len(entries) <= favoritesMaxLen {
+		return entries
+	}
+	out := make([]FavoriteEntry, 0, len(entries))
+	nonPinnedKept := 0
+	pinnedTotal := 0
+	for _, f := range entries {
+		if f.Pinned {
+			pinnedTotal++
+		}
+	}
+	nonPinnedBudget := favoritesMaxLen - pinnedTotal
+	if nonPinnedBudget < 0 {
+		nonPinnedBudget = 0
+	}
+	// entries is already sorted (pinned first, then recency desc), so a single
+	// pass keeps the most-recent non-pinned within budget.
+	for _, f := range entries {
+		if f.Pinned {
+			out = append(out, f)
+			continue
+		}
+		if nonPinnedKept >= nonPinnedBudget {
+			continue
+		}
+		out = append(out, f)
+		nonPinnedKept++
+	}
+	return out
+}
+
+// ToggleFavoritePinned flips the Pinned flag on the entry with the given value.
+// Pinned entries sort above non-pinned and survive the 50-entry cap. Returns
+// the new state, or false if the value wasn't found.
+func (a *App) ToggleFavoritePinned(value string) (pinned bool, ok bool) {
+	a.mu.Lock()
+	idx := -1
+	for i, f := range a.Favorites {
+		if f.Value == value {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		a.mu.Unlock()
+		return false, false
+	}
+	a.Favorites[idx].Pinned = !a.Favorites[idx].Pinned
+	pinned = a.Favorites[idx].Pinned
+	sortFavorites(a.Favorites)
+	snap := append([]FavoriteEntry(nil), a.Favorites...)
+	a.mu.Unlock()
+	go saveFavorites(a.DataDir, snap)
+	return pinned, true
 }
 
 // RemoveFavorite drops one entry by exact value match. Returns true if removed.
@@ -111,6 +178,7 @@ func (a *App) loadFavorites() {
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return
 	}
+	sortFavorites(entries)
 	a.mu.Lock()
 	a.Favorites = entries
 	a.mu.Unlock()

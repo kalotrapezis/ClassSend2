@@ -94,6 +94,12 @@ type Model struct {
 	state     core.ClassState
 	connected bool
 
+	// Pending tool command awaiting --y / --n confirmation. Set when the
+	// teacher types `| HH:MM` for a time already past today — the command
+	// is held here and only scheduled (for tomorrow) on --y. Cleared on
+	// --n or any other input that isn't --y/--n.
+	pendingSchedule *pendingScheduledCmd
+
 	// Easter eggs
 	matrixActive bool
 	matrixFrame  int
@@ -208,6 +214,17 @@ func (m *Model) PushStudentJoin(id, name, ip string) {
 
 func (m *Model) PushStudentLeave(id string) {
 	m.events <- evStudentLeave{id: id}
+}
+
+// PushSysMsg surfaces a system message in the chat scroll, from outside the
+// model goroutine (e.g. the scheduler's fire callback). Non-blocking: drops
+// the message if the event queue is saturated rather than stalling the
+// caller — sys messages are advisory, not critical.
+func (m *Model) PushSysMsg(text string) {
+	select {
+	case m.events <- evSysMsg{text: text}:
+	default:
+	}
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -728,6 +745,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.favoritesDeleteSelected()
 			return nil
 		}
+
+	case "s":
+		// Inside the favorites overlay, 's' pins/unpins the highlighted entry.
+		// Pinned entries float to the top and survive the cap. Outside the
+		// overlay this falls through to chat input.
+		if m.favoritesOpen {
+			m.favoritesTogglePinSelected()
+			return nil
+		}
 	}
 
 	// Number shortcuts inside tools panel
@@ -766,6 +792,70 @@ func (m *Model) trySend() tea.Cmd {
 		m.helpOpen = true
 		m.helpScroll = 0
 		return nil
+	}
+
+	// --y / --n: confirm or reject a pending scheduled command (HH:MM rolled
+	// to tomorrow). Any other input cancels the pending command.
+	if m.app.Role == core.RoleTeacher && m.pendingSchedule != nil {
+		switch text {
+		case "--y", "--yes":
+			job := m.pendingSchedule.job
+			m.pendingSchedule = nil
+			id := m.app.Sched.Add(job)
+			m.pushSysMsg(fmt.Sprintf("⏰ %s → %s @ %s [%s]",
+				job.Label, job.TargetText, job.When.Format("Mon 15:04"), id))
+			return nil
+		case "--n", "--no":
+			m.pendingSchedule = nil
+			m.pushSysMsg("✓ Ακυρώθηκε — η εντολή δεν προγραμματίστηκε.")
+			return nil
+		default:
+			// Drop the pending command but DO let the user's new input fall
+			// through to its normal handler — most natural UX: typing
+			// something else means "I changed my mind, do this instead".
+			m.pendingSchedule = nil
+			m.pushSysMsg("✓ Η εκκρεμής εντολή ακυρώθηκε.")
+			// fall through
+		}
+	}
+
+	// --sched: list pending scheduled jobs, or cancel one by id.
+	if m.app.Role == core.RoleTeacher {
+		if text == "--sched" || text == "--schedule" || text == "--sch" {
+			if m.app.Sched == nil {
+				m.pushSysMsg("ℹ Κανένας προγραμματισμός.")
+				return nil
+			}
+			jobs := m.app.Sched.List()
+			if len(jobs) == 0 {
+				m.pushSysMsg("ℹ Καμία προγραμματισμένη εντολή.")
+				return nil
+			}
+			m.pushSysMsg(fmt.Sprintf("📋 Προγραμματισμένα (%d):", len(jobs)))
+			for _, j := range jobs {
+				m.pushSysMsg(fmt.Sprintf("  [%s] %s → %s @ %s (σε %s)",
+					j.ID, j.Label, j.TargetText,
+					j.When.Format("Mon 15:04"),
+					humanDuration(time.Until(j.When))))
+			}
+			return nil
+		}
+		if strings.HasPrefix(text, "--sched cancel ") ||
+			strings.HasPrefix(text, "--schedule cancel ") ||
+			strings.HasPrefix(text, "--sch cancel ") {
+			id := strings.TrimSpace(text[strings.Index(text, "cancel")+6:])
+			if id == "" {
+				m.pushSysMsg("Χρήση: --sched cancel <id>  (π.χ. --sched cancel S1)")
+				return nil
+			}
+			if job, ok := m.app.Sched.Cancel(id); ok {
+				m.pushSysMsg(fmt.Sprintf("🗑 Ακυρώθηκε [%s] %s → %s @ %s",
+					job.ID, job.Label, job.TargetText, job.When.Format("Mon 15:04")))
+			} else {
+				m.pushSysMsg(fmt.Sprintf("⚠ Δεν βρέθηκε προγραμματισμός: %s", id))
+			}
+			return nil
+		}
 	}
 
 	// Strip optional --send suffix
@@ -1133,12 +1223,249 @@ func (m *Model) trySend() tea.Cmd {
 	return nil
 }
 
+// toolActionEntry is one row of the tool action table.
+type toolActionEntry struct {
+	cmd   string
+	label string
+	param bool // expects a param (e.g. exe path)
+}
+
+// toolActions maps short and full action codes to their protocol command +
+// display label. Both forms are accepted at runtime and shown in the help.
+// Keep aliases in sync with toolActionNames (input-coloring) and toolNames
+// (Tab cycling).
+var toolActions = map[string]toolActionEntry{
+	"lk":               {protocol.CmdLockScreen, "🔒 Κλείδωμα", false},
+	"lock":             {protocol.CmdLockScreen, "🔒 Κλείδωμα", false},
+	"ulk":              {protocol.CmdUnlockScreen, "🔓 Ξεκλείδωμα", false},
+	"unlock":           {protocol.CmdUnlockScreen, "🔓 Ξεκλείδωμα", false},
+	"mu":               {protocol.CmdMute, "🔇 Σίγαση", false},
+	"mute":             {protocol.CmdMute, "🔇 Σίγαση", false},
+	"umu":              {protocol.CmdUnmute, "🔊 Κατάργηση σίγασης", false},
+	"unmute":           {protocol.CmdUnmute, "🔊 Κατάργηση σίγασης", false},
+	"tvon":             {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
+	"start-monitoring": {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
+	"tvoff":            {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
+	"stop-monitoring":  {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
+	"sh":               {protocol.CmdRequestShot, "📷 Στιγμιότυπο", false},
+	"shot":             {protocol.CmdRequestShot, "📷 Στιγμιότυπο", false},
+	"cl":               {protocol.CmdCloseApps, "❌ Κλείσιμο εφαρμογών", false},
+	"close":            {protocol.CmdCloseApps, "❌ Κλείσιμο εφαρμογών", false},
+	"sd":               {protocol.CmdShutdown, "⚡ Τερματισμός", false},
+	"shutdown":         {protocol.CmdShutdown, "⚡ Τερματισμός", false},
+	"bl":               {protocol.CmdBlockChat, "🚫 Αποκλεισμός chat", false},
+	"block":            {protocol.CmdBlockChat, "🚫 Αποκλεισμός chat", false},
+	"ubl":              {protocol.CmdUnblockChat, "✅ Αποδέσμευση chat", false},
+	"unblock":          {protocol.CmdUnblockChat, "✅ Αποδέσμευση chat", false},
+	"fc":               {protocol.CmdFocusApp, "🔍 Εστίαση", true},
+	"focus":            {protocol.CmdFocusApp, "🔍 Εστίαση", true},
+	"ln":               {protocol.CmdLaunchApp, "🚀 Εκκίνηση", true},
+	"launch":           {protocol.CmdLaunchApp, "🚀 Εκκίνηση", true},
+}
+
+// pendingScheduledCmd holds a parsed tool command that needs --y / --n
+// confirmation before being added to the scheduler. Today we use it for one
+// thing only: an HH:MM in the past, which rolls forward to tomorrow.
+type pendingScheduledCmd struct {
+	rawForRetry string // original raw text, used for the system message
+	job         core.ScheduledJob
+}
+
+// schedulableActions is the set of action codes (short or full form) that
+// accept a `| <when>` clause. Focus and shot are deliberately excluded — a
+// scheduled focus is meaningless, a scheduled one-shot screenshot is too
+// transient to be useful. Casting is excluded because it binds to the
+// teacher's screen and a scheduled future cast is fragile to wire.
+var schedulableActions = map[string]bool{
+	"lk": true, "lock": true,
+	"ulk": true, "unlock": true,
+	"mu": true, "mute": true,
+	"umu": true, "unmute": true,
+	"sd": true, "shutdown": true,
+	"cl": true, "close": true,
+	"bl": true, "block": true,
+	"ubl": true, "unblock": true,
+	"ln": true, "launch": true,
+	"tvon": true, "start-monitoring": true,
+	"tvoff": true, "stop-monitoring": true,
+}
+
+// defaultTimeForAction returns the value Tab-completion inserts after a bare
+// `|`. Lock defaults to ":15" (typical "lock the class for 15 minutes" use);
+// everything else defaults to ":3".
+func defaultTimeForAction(action string) string {
+	switch action {
+	case "lk", "lock":
+		return ":15"
+	}
+	return ":3"
+}
+
+// splitToolTimeClause splits a tool-command raw string on the first ` | `
+// (space-pipe-space). Returns (body, timeRaw, hasClause). Trims whitespace
+// off both sides.
+func splitToolTimeClause(raw string) (body, timeRaw string, ok bool) {
+	idx := strings.Index(raw, " | ")
+	if idx < 0 {
+		// Also accept a trailing "|" without surrounding spaces if the user
+		// typed " |X" or "|" — let the time parser surface the error.
+		if i := strings.LastIndex(raw, "|"); i >= 0 {
+			body = strings.TrimSpace(raw[:i])
+			timeRaw = strings.TrimSpace(raw[i+1:])
+			ok = true
+			return
+		}
+		return raw, "", false
+	}
+	return strings.TrimSpace(raw[:idx]), strings.TrimSpace(raw[idx+3:]), true
+}
+
+// parsedToolBody is the action+target+param decomposition shared by the
+// immediate and scheduled command paths.
+type parsedToolBody struct {
+	action      string // raw action code as typed (kept for default-time lookup)
+	entry       toolActionEntry
+	targetID    string
+	targetLabel string
+	param       string
+}
+
+// parseToolBody runs the same action/target/param parse used by the immediate
+// path, but returns an error+message instead of pushing system messages. The
+// caller decides whether to push a warning or surface the error in a
+// scheduling context.
+func (m *Model) parseToolBody(body string) (parsedToolBody, string) {
+	parts := strings.Fields(body)
+	if len(parts) == 0 {
+		return parsedToolBody{}, "κενή εντολή"
+	}
+	actionCode := parts[0]
+	rest := parts[1:]
+	entry, ok := toolActions[actionCode]
+	if !ok {
+		return parsedToolBody{}, fmt.Sprintf("Άγνωστη εντολή: %s", actionCode)
+	}
+	out := parsedToolBody{action: actionCode, entry: entry, targetLabel: "όλους"}
+	i := 0
+	for i < len(rest) {
+		if strings.HasPrefix(rest[i], ">") {
+			num := 0
+			if _, err := fmt.Sscanf(strings.TrimPrefix(rest[i], ">"), "%d", &num); err != nil || num < 1 || num > len(m.students) {
+				return parsedToolBody{}, fmt.Sprintf("Άκυρος στόχος: %s (1–%d)", rest[i], len(m.students))
+			}
+			st := m.students[num-1]
+			out.targetID = st.id
+			out.targetLabel = fmt.Sprintf("%s (>%d)", st.name, num)
+			i++
+		} else {
+			out.param = strings.Join(rest[i:], " ")
+			break
+		}
+	}
+	if entry.param && out.param == "" {
+		return parsedToolBody{}, fmt.Sprintf("Η εντολή %s απαιτεί παράμετρο", actionCode)
+	}
+	return out, ""
+}
+
+// handleScheduledToolCmd is the scheduling counterpart of handleToolCmd. The
+// `| <when>` clause has already been split off; body is everything to the
+// left and timeRaw is what was right of the pipe.
+func (m *Model) handleScheduledToolCmd(body, timeRaw string) tea.Cmd {
+	parsed, errMsg := m.parseToolBody(body)
+	if errMsg != "" {
+		m.pushSysMsg("⚠ " + errMsg)
+		return nil
+	}
+	if !schedulableActions[parsed.action] {
+		m.pushSysMsg(fmt.Sprintf("⚠ Η εντολή %s δεν προγραμματίζεται (focus, shot, casting)", parsed.action))
+		return nil
+	}
+	when, err := core.ParseWhen(timeRaw, time.Now())
+	if err != nil {
+		m.pushSysMsg("⚠ " + err.Error())
+		return nil
+	}
+
+	// Lock-with-duration: send the lock now and queue the unlock at +N min.
+	// We model "now" as a direct SendCommand so the existing immediate-path
+	// rendering applies; only the unlock is queued.
+	isLockDuration := (parsed.action == "lk" || parsed.action == "lock") && when.IsDuration
+	if isLockDuration {
+		if err := m.app.SendCommand(parsed.entry.cmd, parsed.param, parsed.targetID); err != nil {
+			m.pushSysMsg("⚠ " + err.Error())
+			return nil
+		}
+		unlockEntry := toolActions["unlock"]
+		unlockJob := core.ScheduledJob{
+			Action:     unlockEntry.cmd,
+			Param:      "",
+			TargetID:   parsed.targetID,
+			TargetText: parsed.targetLabel,
+			Label:      unlockEntry.label,
+			When:       when.Absolute,
+		}
+		id := m.app.Sched.Add(unlockJob)
+		m.pushSysMsg(fmt.Sprintf("🔒 Κλείδωμα → %s · 🔓 αυτόματο ξεκλείδωμα σε %dλ [%s]",
+			parsed.targetLabel, when.DurationMin, id))
+		return nil
+	}
+
+	job := core.ScheduledJob{
+		Action:     parsed.entry.cmd,
+		Param:      parsed.param,
+		TargetID:   parsed.targetID,
+		TargetText: parsed.targetLabel,
+		Label:      parsed.entry.label,
+		When:       when.Absolute,
+	}
+
+	if when.RollOver {
+		// HH:MM already past today — require explicit Y/N. Stash the job and
+		// surface a single-line confirmation prompt.
+		m.pendingSchedule = &pendingScheduledCmd{rawForRetry: body + " | " + timeRaw, job: job}
+		m.pushSysMsg(fmt.Sprintf("⚠ Η ώρα %s έχει περάσει σήμερα. Προγραμματισμός για αύριο %s; (--y / --n)",
+			timeRaw, when.Absolute.Format("Mon 15:04")))
+		return nil
+	}
+
+	id := m.app.Sched.Add(job)
+	m.pushSysMsg(fmt.Sprintf("⏰ %s → %s @ %s (σε %s) [%s]",
+		parsed.entry.label, parsed.targetLabel,
+		when.Absolute.Format("15:04"),
+		humanDuration(time.Until(when.Absolute)),
+		id))
+	return nil
+}
+
+// humanDuration renders a Duration as Greek "Xώ Yλ" / "Yλ" / "Zδ".
+func humanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%dδ", int(d.Seconds()))
+	}
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	if h > 0 {
+		return fmt.Sprintf("%dώ %dλ", h, m)
+	}
+	return fmt.Sprintf("%dλ", m)
+}
+
 // handleToolCmd parses: <action> [-a | -s <num>] [param]
 // Returns a tea.Cmd: nil for normal commands, tea.ClearScreen for actions
 // that spawn a subprocess (start-monitoring/tvon/stop-monitoring/tvoff). The
 // spawn briefly disrupts the Windows console state and bubbletea's incremental
 // renderer leaves stale rows on screen — ClearScreen forces a full repaint.
 func (m *Model) handleToolCmd(raw string) tea.Cmd {
+	// Time clause: `… | HH:MM` or `… | :NN`. Strip it first; the body is
+	// parsed by the existing action/target/param logic and then scheduled.
+	body, timeRaw, hasTime := splitToolTimeClause(raw)
+	if hasTime {
+		return m.handleScheduledToolCmd(body, timeRaw)
+	}
 	parts := strings.Fields(raw)
 	if len(parts) == 0 {
 		m.pushSysMsg("Χρήση: --t <action> [-a | -s <num>] [param]  —  --help για λίστα")
@@ -1167,45 +1494,7 @@ func (m *Model) handleToolCmd(raw string) tea.Cmd {
 		return nil
 	}
 
-	// Resolve action code → protocol command
-	type actionEntry struct {
-		cmd   string
-		label string
-		param bool // expects a param (e.g. exe path)
-	}
-	// Each action has a short and a full form. Both forms are accepted at
-	// runtime and shown in the help. Keep aliases in sync with toolActionNames
-	// (input-coloring) and toolNames (Tab cycling).
-	actions := map[string]actionEntry{
-		"lk":               {protocol.CmdLockScreen, "🔒 Κλείδωμα", false},
-		"lock":             {protocol.CmdLockScreen, "🔒 Κλείδωμα", false},
-		"ulk":              {protocol.CmdUnlockScreen, "🔓 Ξεκλείδωμα", false},
-		"unlock":           {protocol.CmdUnlockScreen, "🔓 Ξεκλείδωμα", false},
-		"mu":               {protocol.CmdMute, "🔇 Σίγαση", false},
-		"mute":             {protocol.CmdMute, "🔇 Σίγαση", false},
-		"umu":              {protocol.CmdUnmute, "🔊 Κατάργηση σίγασης", false},
-		"unmute":           {protocol.CmdUnmute, "🔊 Κατάργηση σίγασης", false},
-		"tvon":             {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
-		"start-monitoring": {protocol.CmdStartMonitor, "👁 Παρακολούθηση on", false},
-		"tvoff":            {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
-		"stop-monitoring":  {protocol.CmdStopMonitor, "👁 Παρακολούθηση off", false},
-		"sh":               {protocol.CmdRequestShot, "📷 Στιγμιότυπο", false},
-		"shot":             {protocol.CmdRequestShot, "📷 Στιγμιότυπο", false},
-		"cl":               {protocol.CmdCloseApps, "❌ Κλείσιμο εφαρμογών", false},
-		"close":            {protocol.CmdCloseApps, "❌ Κλείσιμο εφαρμογών", false},
-		"sd":               {protocol.CmdShutdown, "⚡ Τερματισμός", false},
-		"shutdown":         {protocol.CmdShutdown, "⚡ Τερματισμός", false},
-		"bl":               {protocol.CmdBlockChat, "🚫 Αποκλεισμός chat", false},
-		"block":            {protocol.CmdBlockChat, "🚫 Αποκλεισμός chat", false},
-		"ubl":              {protocol.CmdUnblockChat, "✅ Αποδέσμευση chat", false},
-		"unblock":          {protocol.CmdUnblockChat, "✅ Αποδέσμευση chat", false},
-		"fc":               {protocol.CmdFocusApp, "🔍 Εστίαση", true},
-		"focus":            {protocol.CmdFocusApp, "🔍 Εστίαση", true},
-		"ln":               {protocol.CmdLaunchApp, "🚀 Εκκίνηση", true},
-		"launch":           {protocol.CmdLaunchApp, "🚀 Εκκίνηση", true},
-	}
-
-	entry, ok := actions[actionCode]
+	entry, ok := toolActions[actionCode]
 	if !ok {
 		m.pushSysMsg(fmt.Sprintf("Άγνωστη εντολή: %s — --help για λίστα", actionCode))
 		return nil
@@ -1368,6 +1657,20 @@ func helpLinesTeacher() []string {
 		"  --t ln     / launch   <exe>        🚀 εκκίνηση εφαρμογής",
 		"      π.χ.  --t ln notepad.exe       (σε όλους)",
 		"            --t ln >3 calc.exe       (στον μαθητή #3)",
+		"",
+		"  ⏰ ΧΡΟΝΟΠΡΟΓΡΑΜΜΑΤΙΣΜΟΣ   (πρόσθεσε  | HH:MM  ή  | :λεπτά)",
+		"  Tab μετά το `|` συμπληρώνει αυτόματα `:3` (`:15` για lock).",
+		"  Δεν προγραμματίζονται: focus, shot, casting.",
+		"      π.χ.  --t shutdown >* | 13:15   (τερματισμός όλων στις 13:15)",
+		"            --t sd | :30              (τερματισμός σε 30 λεπτά)",
+		"            --t lock >* | :15         (lock για 15 λεπτά — αυτο-unlock)",
+		"            --t lock >* | 09:30       (lock στις 09:30, μένει κλειδωμένο)",
+		"            --t ln >2 notepad.exe | :5  (εκκίνηση σε 5 λεπτά)",
+		"  Αν η HH:MM έχει περάσει σήμερα, ζητείται επιβεβαίωση (--y / --n)",
+		"  για να προγραμματιστεί την επόμενη μέρα.",
+		"",
+		"  --sched                              λίστα προγραμματισμένων εντολών",
+		"  --sched cancel <id>                  ακύρωση (π.χ. --sched cancel S1)",
 		"",
 		"  ────────────────────────────────────────────",
 		"  ΔΙΑΧΕΙΡΙΣΗ ΚΑΙ ΑΠΟΣΤΟΛΗ ΜΗΝΥΜΑΤΩΝ",
@@ -1680,8 +1983,12 @@ func (m *Model) overlayFavorites(base string) string {
 		}
 		for i := start; i < end; i++ {
 			f := favs[i]
+			marker := "  "
+			if f.Pinned {
+				marker = "★ "
+			}
 			label := truncateNote(f.Value, overlayW-4)
-			line := "  " + label
+			line := marker + label
 			if i == m.favoritesCursor {
 				line = styleSelected.Width(overlayW).Render(line)
 			} else {
@@ -1692,7 +1999,7 @@ func (m *Model) overlayFavorites(base string) string {
 	}
 
 	out = append(out, strings.Repeat("─", overlayW))
-	hint := "[↑↓] επιλογή  [Enter] τοποθέτηση στο πεδίο  [d] διαγραφή  [Esc] κλείσιμο"
+	hint := "[↑↓] επιλογή  [Enter] τοποθέτηση  [s] ★ pin  [d] διαγραφή  [Esc] κλείσιμο"
 	out = append(out, styleHint.Render(hint))
 
 	panel := styleBorder.Padding(1, 2).Render(strings.Join(out, "\n"))
@@ -1772,11 +2079,41 @@ func (m *Model) favoritesPlaceSelected() {
 		return
 	}
 	val := favs[m.favoritesCursor].Value
-	// Quote so paths with spaces survive the parser. URLs don't need quotes
-	// but quoting them is harmless — push-open accepts both.
-	m.input.SetValue(fmt.Sprintf(`--op "%s" >`, val))
+	// Quote only when the value contains whitespace. Unconditional quoting
+	// broke bare URLs: `cmd /c start "" "google.gr"` made Windows look up a
+	// protocol literally named `"google.gr"` instead of the URL.
+	var insert string
+	if strings.ContainsAny(val, " \t") {
+		insert = fmt.Sprintf(`--op "%s" >`, val)
+	} else {
+		insert = fmt.Sprintf(`--op %s >`, val)
+	}
+	m.input.SetValue(insert)
 	m.favoritesOpen = false
 	m.focusInput = true
+}
+
+// favoritesTogglePinSelected flips the Pinned flag on the highlighted entry.
+// Pinned entries float above non-pinned and survive the 50-entry cap.
+func (m *Model) favoritesTogglePinSelected() {
+	favs := m.app.FavoritesSnapshot()
+	if len(favs) == 0 || m.favoritesCursor < 0 || m.favoritesCursor >= len(favs) {
+		return
+	}
+	val := favs[m.favoritesCursor].Value
+	pinned, ok := m.app.ToggleFavoritePinned(val)
+	if !ok {
+		return
+	}
+	if pinned {
+		m.pushSysMsg("★ Καρφιτσώθηκε στο Path Notes: " + val)
+		// Pinned entries sort to top — jump the cursor up so the user can see
+		// where it landed.
+		m.favoritesCursor = 0
+		m.favoritesScroll = 0
+	} else {
+		m.pushSysMsg("☆ Ξεκαρφιτσώθηκε από Path Notes: " + val)
+	}
 }
 
 // favoritesDeleteSelected removes the highlighted entry from the persisted list.
@@ -2942,6 +3279,34 @@ func (m *Model) parseMsgPos(pos string) (string, error) {
 	return window[y-1], nil
 }
 
+// splitQuoted splits s on whitespace, treating "..."-quoted runs as a single
+// token. Quotes are preserved on the returned tokens so callers can strip
+// them explicitly (keeps the token-vs-literal distinction visible).
+func splitQuoted(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	flush := func() {
+		if cur.Len() > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case !inQuote && (r == ' ' || r == '\t'):
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return out
+}
+
 // parsePushOpenCmd detects teacher push-open syntax and returns (target, destStr, ok).
 // Form 1: "--op / --open <target> >N|>*"  (requires ">" to distinguish from local open)
 // Form 2: "<url> --op [>N|>*]"            (text before --op is the URL, does NOT start with --)
@@ -2954,13 +3319,17 @@ func parsePushOpenCmd(text string) (target, destStr string, ok bool) {
 		form1Tail = strings.TrimPrefix(text, "--open ")
 	}
 	if form1Tail != "" {
-		parts := strings.Fields(form1Tail)
+		// Quote-aware split so `--op "C:\Path with spaces\f.pdf" >3` parses
+		// with target = `C:\Path with spaces\f.pdf` and dest = `3`. Bare
+		// `--op google.gr >*` still works because unquoted tokens split on
+		// whitespace as before.
+		parts := splitQuoted(form1Tail)
 		if len(parts) == 0 {
 			return
 		}
 		for _, p := range parts[1:] {
 			if strings.HasPrefix(p, ">") {
-				target = parts[0]
+				target = strings.Trim(parts[0], `"`)
 				destStr = strings.TrimPrefix(p, ">")
 				if destStr == "" {
 					destStr = "*"
@@ -2979,7 +3348,7 @@ func parsePushOpenCmd(text string) (target, destStr string, ok bool) {
 	if idx < 0 {
 		return
 	}
-	target = strings.TrimSpace(text[:idx])
+	target = strings.Trim(strings.TrimSpace(text[:idx]), `"`)
 	rest := strings.TrimSpace(text[idx+5:])
 	destStr = "*"
 	if strings.HasPrefix(rest, ">") {
@@ -3191,6 +3560,32 @@ func (m *Model) doTabComplete() {
 		return
 	}
 
+	// Time-clause completion: any --t / --tool command ending in `|` or `| `
+	// expands to the action's default time (`:15` for lock, `:3` otherwise).
+	// Lets the teacher type `--t lock >* |<Tab>` to get a one-keystroke lock.
+	if strings.HasPrefix(cur, "--t ") || strings.HasPrefix(cur, "--tool ") {
+		trimmedRight := strings.TrimRight(cur, " ")
+		if strings.HasSuffix(trimmedRight, "|") {
+			// Find the action token (first word after the prefix) to pick
+			// the right default. We're tolerant about target/param noise.
+			afterPrefix := strings.TrimPrefix(cur, "--t ")
+			afterPrefix = strings.TrimPrefix(afterPrefix, "--tool ")
+			fields := strings.Fields(afterPrefix)
+			action := ""
+			if len(fields) > 0 {
+				action = fields[0]
+			}
+			def := defaultTimeForAction(action)
+			// Normalize trailing whitespace so the inserted default sits
+			// exactly one space after `|`.
+			base := strings.TrimRight(trimmedRight, "|")
+			base = strings.TrimRight(base, " ")
+			m.input.SetValue(base + " | " + def)
+			m.input.CursorEnd()
+			return
+		}
+	}
+
 	trimmed := strings.TrimSpace(cur)
 	if trimmed == "" {
 		return
@@ -3299,6 +3694,9 @@ var knownCmdTokens = map[string]bool{
 	"--mon":  true, "--monitor": true,
 	"--log": true,
 	"--pa":  true, "--path": true,
+	"--y": true, "--yes": true,
+	"--n": true, "--no": true,
+	"--sched": true, "--schedule": true, "--sch": true,
 }
 
 // toolActionNames is the canonical set of valid --t actions. Used both for

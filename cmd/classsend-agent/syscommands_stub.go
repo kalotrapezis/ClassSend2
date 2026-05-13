@@ -6,6 +6,8 @@ import "classsend/internal/core"
 
 func setupStudentCommands(_ *core.App, _ bool) {}
 func startHealthBeacon()                        {}
+func startLoadMonitor()                         {}
+func isUnderLoad() bool                         { return false }
 func hideConsole()                              {}
 func ensureAutostart()                          {}
 func setAutostart(_ bool) error                 { return nil }
