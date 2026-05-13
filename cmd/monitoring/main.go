@@ -55,6 +55,11 @@ var (
 	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 	procSetWindowTextW   = user32.NewProc("SetWindowTextW")
 	procLoadCursorW      = user32.NewProc("LoadCursorW")
+	procSetWindowPos     = user32.NewProc("SetWindowPos")
+	procGetWindowLongW   = user32.NewProc("GetWindowLongW")
+	procSetWindowLongW   = user32.NewProc("SetWindowLongW")
+	procGetWindowRect    = user32.NewProc("GetWindowRect")
+	procGetKeyState      = user32.NewProc("GetKeyState")
 
 	// Painting / GDI
 	procBeginPaint             = user32.NewProc("BeginPaint")
@@ -113,10 +118,31 @@ const (
 	wmUpdate       = wmUser + 1 // custom: grid data changed — repaint
 	wmPipeEOF      = wmUser + 2 // custom: pipe closed by classsend
 
-	vkEscape = 0x1B
+	vkEscape  = 0x1B
+	vkControl = 0x11
+	vkF       = 0x46
+	vkT       = 0x54
+	vkW       = 0x57
+
+	// SetWindowPos flags
+	swpNoSize     = 0x0001
+	swpNoMove     = 0x0002
+	swpNoZorder   = 0x0004
+	swpFrameChanged = 0x0020
+	swpShowWindow = 0x0040
+
+	// HWND sentinel values used by SetWindowPos. The Win32 docs cast these
+	// to HWND; in Go uintptr arithmetic, -1 = ^uintptr(0), -2 = ^uintptr(1).
+	hwndTopmost   = ^uintptr(0) // HWND_TOPMOST = (HWND)-1
+	hwndNoTopmost = ^uintptr(1) // HWND_NOTOPMOST = (HWND)-2
+
+	wsPopup      = 0x80000000
+	wsCaption    = 0x00C00000
+	wsThickFrame = 0x00040000
 
 	// Pipe protocol — back-channel (monitoring → classsend)
-	msgFocus uint32 = 5
+	msgFocus       uint32 = 5
+	msgStopRequest uint32 = 6 // monitoring → teacher: ^W in window; clean up session
 
 	// Sentinel: leave focus mode and resume the grid round-robin.
 	focusUnset uint32 = 0xFFFFFFFF
@@ -241,6 +267,73 @@ func init() {
 	wndProcCallback = syscall.NewCallback(monitorWndProc)
 }
 
+// ── Window shortcuts: state + helpers ─────────────────────────────────────────
+//
+// ^F = toggle fullscreen, ^T = toggle always-on-top, ^W = stop monitoring,
+// Esc = leave focus mode OR close window if not focused. Shortcuts fire when
+// the monitoring window has keyboard focus; they're not registered as global
+// system hotkeys (would conflict with the teacher TUI's existing ^F / ^T / ^W
+// bindings on the terminal side).
+
+var (
+	// Saved style + position so fullscreen toggle can restore.
+	preFullscreenStyle int32
+	preFullscreenRect  winRect
+	isFullscreen       bool
+	isTopmost          bool
+)
+
+func isCtrlDown() bool {
+	r, _, _ := procGetKeyState.Call(uintptr(vkControl))
+	// GetKeyState returns a SHORT; high bit set ⇒ key is down. Mask the low
+	// 16 bits and test against 0x8000 to dodge sign-bit casting gymnastics.
+	return (uint16(r) & 0x8000) != 0
+}
+
+// toggleFullscreen swaps between borderless-fullscreen and the previous
+// windowed size/style. Standard Win32 fullscreen pattern: drop WS_CAPTION +
+// WS_THICKFRAME, snap to monitor extents, and reverse on exit.
+func toggleFullscreen(hwnd uintptr) {
+	// GWL_STYLE = -16. Held in an int32 variable (not a const) because Go
+	// refuses to evaluate uint32(-16) at compile time; the runtime cast
+	// produces the correct two's-complement bit pattern.
+	var gwlStyleI int32 = -16
+	gwlStyleArg := uintptr(uint32(gwlStyleI))
+	if !isFullscreen {
+		styleR, _, _ := procGetWindowLongW.Call(hwnd, gwlStyleArg)
+		preFullscreenStyle = int32(styleR)
+		procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&preFullscreenRect)))
+
+		newStyle := preFullscreenStyle &^ int32(wsCaption|wsThickFrame)
+		procSetWindowLongW.Call(hwnd, gwlStyleArg, uintptr(uint32(newStyle)))
+		sw, _, _ := procGetSystemMetrics.Call(smCxScreen)
+		sh, _, _ := procGetSystemMetrics.Call(smCyScreen)
+		procSetWindowPos.Call(hwnd, 0, 0, 0, sw, sh, uintptr(swpNoZorder|swpFrameChanged|swpShowWindow))
+		isFullscreen = true
+		devlog.Logf("shortcut: fullscreen ON  %dx%d", sw, sh)
+		return
+	}
+	procSetWindowLongW.Call(hwnd, gwlStyleArg, uintptr(uint32(preFullscreenStyle)))
+	r := preFullscreenRect
+	procSetWindowPos.Call(hwnd, 0,
+		uintptr(r.Left), uintptr(r.Top),
+		uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top),
+		uintptr(swpNoZorder|swpFrameChanged|swpShowWindow))
+	isFullscreen = false
+	devlog.Logf("shortcut: fullscreen OFF")
+}
+
+// toggleTopmost flips the WS_EX_TOPMOST extended style via SetWindowPos.
+func toggleTopmost(hwnd uintptr) {
+	hwndZ := hwndTopmost
+	if isTopmost {
+		hwndZ = hwndNoTopmost
+	}
+	procSetWindowPos.Call(hwnd, hwndZ, 0, 0, 0, 0, uintptr(swpNoMove|swpNoSize))
+	isTopmost = !isTopmost
+	devlog.Logf("shortcut: always-on-top = %v", isTopmost)
+}
+
 // ── Window procedure ──────────────────────────────────────────────────────────
 
 func monitorWndProc(hwnd, msg, wParam, lParam uintptr) (ret uintptr) {
@@ -282,8 +375,12 @@ func monitorWndProc(hwnd, msg, wParam, lParam uintptr) (ret uintptr) {
 		procInvalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmKeydown:
-		// Esc leaves focus mode.
-		if wParam == vkEscape {
+		// Window-level shortcuts. Ctrl+F fullscreen, Ctrl+T always-on-top,
+		// Ctrl+W stop monitoring (closes window — teacher detects pipe EOF
+		// and cleans up the session), Esc exits focus mode if focused, else
+		// closes the window.
+		switch wParam {
+		case vkEscape:
 			focusMu.Lock()
 			wasFocused := focusIdx >= 0
 			focusIdx = -1
@@ -291,7 +388,28 @@ func monitorWndProc(hwnd, msg, wParam, lParam uintptr) (ret uintptr) {
 			if wasFocused {
 				sendFocusBackChannel(focusUnset)
 				procInvalidateRect.Call(hwnd, 0, 0)
+				return 0
 			}
+			// Not in focus mode — Esc closes the window.
+			procPostMessageW.Call(hwnd, uintptr(wmClose), 0, 0)
+			return 0
+		case vkF:
+			if isCtrlDown() {
+				toggleFullscreen(hwnd)
+			}
+			return 0
+		case vkT:
+			if isCtrlDown() {
+				toggleTopmost(hwnd)
+			}
+			return 0
+		case vkW:
+			if isCtrlDown() {
+				devlog.Logf("shortcut: ^W stop monitoring")
+				sendStopRequestBackChannel()
+				procPostMessageW.Call(hwnd, uintptr(wmClose), 0, 0)
+			}
+			return 0
 		}
 		return 0
 	case wmPipeEOF:
@@ -369,6 +487,33 @@ func sendFocusBackChannel(idx uint32) {
 	} else {
 		devlog.Logf("focus click: sent FOCUS idx=%d", idx)
 	}
+}
+
+// sendStopRequestBackChannel tells the teacher the user pressed ^W in the
+// monitoring window. Teacher receives this and closes the session cleanly —
+// otherwise the session would keep polling students for shots even though no
+// monitoring.exe is alive to display them.
+func sendStopRequestBackChannel() {
+	pipeMu.Lock()
+	h := pipeHandle
+	pipeMu.Unlock()
+	if h == 0 {
+		return
+	}
+	frame := make([]byte, 8)
+	binary.LittleEndian.PutUint32(frame[0:4], msgStopRequest)
+	binary.LittleEndian.PutUint32(frame[4:8], 0)
+	op, err := newPipeOp()
+	if err != nil {
+		devlog.Logf("^W: newPipeOp: %v", err)
+		return
+	}
+	defer op.close()
+	if err := pipeWriteAll(h, op, frame, 2*time.Second); err != nil {
+		devlog.Logf("^W: write failed: %v", err)
+		return
+	}
+	devlog.Logf("^W: sent stop request to teacher")
 }
 
 // ── Painting ──────────────────────────────────────────────────────────────────
