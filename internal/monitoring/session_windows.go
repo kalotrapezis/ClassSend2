@@ -71,7 +71,8 @@ const (
 	MsgShot    uint32 = 2
 	MsgOffline uint32 = 3
 	MsgStop    uint32 = 4
-	MsgFocus   uint32 = 5
+	MsgFocus       uint32 = 5
+	MsgStopRequest uint32 = 6 // monitoring → teacher: user pressed ^W in the window; clean up the session
 )
 
 // FocusUnset is the sentinel index meaning "leave focus mode".
@@ -412,7 +413,21 @@ func StartSession(
 	focusIdx.Store(-1) // -1 = grid mode
 
 	// Back-channel reader: monitoring.exe → teacher. Owns its own pipeOp.
-	go readPipeBackChannel(pipe, &focusIdx, stopCh)
+	// Two messages: MsgFocus (cell selection) and MsgStopRequest (^W in the
+	// monitoring window). We pass a closure that triggers stop() so the
+	// reader can ask for session shutdown without owning stopCh directly.
+	stopOnce := sync.Once{}
+	requestStop := func() {
+		stopOnce.Do(func() {
+			devlog.Logf("monitoring: stop requested via back-channel (^W)")
+			select {
+			case <-stopCh:
+			default:
+				close(stopCh)
+			}
+		})
+	}
+	go readPipeBackChannel(pipe, &focusIdx, stopCh, requestStop)
 
 	// Two decoupled goroutines:
 	//
@@ -721,10 +736,12 @@ func StartSession(
 	return stop, nudge, nil
 }
 
-// readPipeBackChannel reads MsgFocus messages sent by monitoring.exe and
-// updates focusIdx atomically. Exits silently when the pipe closes (which
-// happens when the monitoring window closes or the session stops).
-func readPipeBackChannel(handle uintptr, focusIdx *atomic.Int32, stop <-chan struct{}) {
+// readPipeBackChannel reads back-channel messages from monitoring.exe and
+// dispatches them: MsgFocus updates focusIdx, MsgStopRequest invokes
+// requestStop (the user pressed ^W in the window — clean up the session).
+// Exits silently when the pipe closes (window closed by X click or process
+// killed) or when stop fires.
+func readPipeBackChannel(handle uintptr, focusIdx *atomic.Int32, stop <-chan struct{}, requestStop func()) {
 	op, err := newPipeOp()
 	if err != nil {
 		devlog.Logf("monitoring: back-channel newPipeOp: %v", err)
@@ -752,15 +769,24 @@ func readPipeBackChannel(handle uintptr, focusIdx *atomic.Int32, stop <-chan str
 				return
 			}
 		}
-		if msgType == MsgFocus && len(payload) >= 4 {
-			idx := binary.LittleEndian.Uint32(payload[0:4])
-			if idx == FocusUnset {
-				focusIdx.Store(-1)
-				devlog.Logf("monitoring: back-channel UNFOCUS")
-			} else {
-				focusIdx.Store(int32(idx))
-				devlog.Logf("monitoring: back-channel FOCUS idx=%d", idx)
+		switch msgType {
+		case MsgFocus:
+			if len(payload) >= 4 {
+				idx := binary.LittleEndian.Uint32(payload[0:4])
+				if idx == FocusUnset {
+					focusIdx.Store(-1)
+					devlog.Logf("monitoring: back-channel UNFOCUS")
+				} else {
+					focusIdx.Store(int32(idx))
+					devlog.Logf("monitoring: back-channel FOCUS idx=%d", idx)
+				}
 			}
+		case MsgStopRequest:
+			devlog.Logf("monitoring: back-channel STOP request")
+			if requestStop != nil {
+				requestStop()
+			}
+			return
 		}
 	}
 }
