@@ -117,20 +117,21 @@ type Model struct {
 }
 
 var tools = []struct {
-	key    string
-	label  string
-	action string
+	key      string
+	label    string
+	action   string
+	shortcut string // global ^-key equivalent, shown in the ^T overlay as a passive teaching aid
 }{
-	{"1", "Κλείδωμα οθονών", protocol.CmdLockScreen},
-	{"2", "Ξεκλείδωμα", protocol.CmdUnlockScreen},
-	{"3", "Αποκλ. μηνυμάτων", protocol.CmdBlockChat},
-	{"4", "Αποδ. μηνυμάτων", protocol.CmdUnblockChat},
-	{"5", "Κλείσιμο εφαρμογών", protocol.CmdCloseApps},
-	{"6", "Σίγαση", protocol.CmdMute},
-	{"7", "Κατάργηση σίγασης", protocol.CmdUnmute},
-	{"8", "Τερματισμός", protocol.CmdShutdown},
-	{"9", "Παρακολούθηση", protocol.CmdStartMonitor},
-	{"0", "Διακοπή παρακολ.", protocol.CmdStopMonitor},
+	{"1", "Κλείδωμα οθονών", protocol.CmdLockScreen, "^L"},
+	{"2", "Ξεκλείδωμα", protocol.CmdUnlockScreen, "^L"},
+	{"3", "Αποκλ. μηνυμάτων", protocol.CmdBlockChat, ""},
+	{"4", "Αποδ. μηνυμάτων", protocol.CmdUnblockChat, ""},
+	{"5", "Κλείσιμο εφαρμογών", protocol.CmdCloseApps, ""},
+	{"6", "Σίγαση", protocol.CmdMute, "^Z"},
+	{"7", "Κατάργηση σίγασης", protocol.CmdUnmute, "^Z"},
+	{"8", "Τερματισμός", protocol.CmdShutdown, ""},
+	{"9", "Παρακολούθηση", protocol.CmdStartMonitor, "^W"},
+	{"0", "Διακοπή παρακολ.", protocol.CmdStopMonitor, "^W"},
 }
 
 func New(app *core.App) *Model {
@@ -2655,12 +2656,25 @@ func (m *Model) overlayTools(base string) string {
 	lines = append(lines, styleTitle.Render("⚙ (T)ools — Εργαλεία Δασκάλου"))
 	lines = append(lines, strings.Repeat("─", 34))
 
+	const toolsPanelW = 34
+	scStyle := lipgloss.NewStyle().Foreground(colTextDim)
 	for i, t := range tools {
-		line := fmt.Sprintf(" [%s] %s", t.key, t.label)
-		if i == m.toolsCursor {
-			line = styleSelected.Width(34).Render(line)
+		left := fmt.Sprintf(" [%s] %s", t.key, t.label)
+		var content string
+		if t.shortcut != "" {
+			gap := toolsPanelW - lipgloss.Width(left) - lipgloss.Width(t.shortcut) - 1
+			if gap < 1 {
+				gap = 1
+			}
+			content = left + strings.Repeat(" ", gap) + scStyle.Render(t.shortcut) + " "
 		} else {
-			line = lipgloss.NewStyle().Width(34).Foreground(colText).Render(line)
+			content = left
+		}
+		var line string
+		if i == m.toolsCursor {
+			line = styleSelected.Width(toolsPanelW).Render(content)
+		} else {
+			line = lipgloss.NewStyle().Width(toolsPanelW).Foreground(colText).Render(content)
 		}
 		lines = append(lines, line)
 	}

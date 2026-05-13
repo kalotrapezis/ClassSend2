@@ -16,6 +16,24 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.2] — 2026-05-13
+
+A small UX polish release on top of 0.2.1, plus a rebuild of the Win7 agent so legacy student PCs finally pick up the v0.2.0 system-load safe-mode protection.
+
+### Added
+
+- **Keyboard-shortcut column in the `^T` tools overlay** ([internal/tui/model.go](internal/tui/model.go) `overlayTools`). Each tool entry now shows its global `Ctrl`-shortcut right-aligned in `colTextDim`: `Κλείδωμα οθονών   ^L`, `Σίγαση   ^Z`, `Παρακολούθηση   ^W`, etc. Tools without a global binding (block chat, close apps, shutdown) leave the column blank — the empty slot itself is a signal that those still need the menu. Same `tools` slice now carries the `shortcut` field, so the source of truth stays in one place. Mouse/touch users who lean on the menu gradually internalise the bindings without being told to, in the same spirit as VS Code or Sublime menus.
+
+### Fixed
+
+- **Win7 agent shipped stale.** The `dist/classsend-agent-win7-x86.exe` in the v0.2.0 / 0.2.1 installers was the May-7 build — built **before** [cmd/classsend-agent/load_windows.go](cmd/classsend-agent/load_windows.go) landed (May 13). On Win7 students the load-monitor / safe-mode protection was therefore absent. Resolved by re-running `build-win7.bat`; the new binary is ~51 KB larger and includes the safe-mode code path. `GetSystemTimes` and `GlobalMemoryStatusEx` are both Win7-compatible so the protection works identically on legacy hosts.
+
+### Notes
+
+- No protocol or wire-format change. Existing teacher ↔ student pairings keep working in mixed-version setups; the only user-visible effect is the extra column inside the `^T` panel.
+
+---
+
 ## [0.2.1] — 2026-05-13
 
 Polish on top of 0.2.0. The monitoring window now has a one-line keyboard hint bar at the bottom of the grid so the new shortcuts are discoverable without opening help.
