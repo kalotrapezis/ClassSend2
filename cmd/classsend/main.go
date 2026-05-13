@@ -84,6 +84,18 @@ func main() {
 		}
 		wireMonitoring(app)
 		wireCasting(app)
+		// Scheduler fire callback: send the queued command exactly as if the
+		// teacher had typed it now, then push a one-line confirmation into
+		// the chat scroll so it's visible without opening --sched.
+		if app.Sched != nil {
+			app.Sched.Fire = func(job core.ScheduledJob) {
+				if err := app.SendCommand(job.Action, job.Param, job.TargetID); err != nil {
+					model.PushSysMsg(fmt.Sprintf("⚠ Προγραμματισμός [%s] απέτυχε: %v", job.ID, err))
+					return
+				}
+				model.PushSysMsg(fmt.Sprintf("⏰ Εκτελέστηκε [%s] %s → %s", job.ID, job.Label, job.TargetText))
+			}
+		}
 	}
 
 	p := tea.NewProgram(
@@ -109,10 +121,10 @@ func dataDirectory() string {
 func wireMonitoring(app *core.App) {
 	shotCh := make(chan monitoring.ShotMsg, 8)
 
-	app.OnScreenshot = func(studentID string, jpegData []byte) {
+	app.OnScreenshot = func(studentID string, jpegData []byte, status string) {
 		select {
-		case shotCh <- monitoring.ShotMsg{StudentID: studentID, Data: jpegData}:
-			devlog.Logf("OnScreenshot: queued  student=%s jpeg=%dB chLen=%d", studentID, len(jpegData), len(shotCh))
+		case shotCh <- monitoring.ShotMsg{StudentID: studentID, Data: jpegData, Status: status}:
+			devlog.Logf("OnScreenshot: queued  student=%s jpeg=%dB status=%q chLen=%d", studentID, len(jpegData), status, len(shotCh))
 		default:
 			devlog.Logf("OnScreenshot: DROPPED (channel full)  student=%s jpeg=%dB", studentID, len(jpegData))
 		}

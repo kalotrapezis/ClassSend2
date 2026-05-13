@@ -96,6 +96,10 @@ type App struct {
 	Blacklist []string
 	Whitelist []string
 
+	// Sched — teacher-side command scheduler (`--t … | HH:MM` / `| :NN`).
+	// Lives only as long as the teacher process; no persistence in v1.
+	Sched *Scheduler
+
 	// Favorites — recent push-open URLs / attached file paths (teacher only).
 	// Populated automatically by PushOpenURL and SendFile so the teacher can
 	// re-launch the same target without retyping the path. UI lives in the
@@ -120,7 +124,7 @@ type App struct {
 	OnStudentMissing   func(mac, nickname, hostname string, count int)
 	OnFileReceived     func(fileID, name string)
 	OnSysMsg           func(text string) // student-side system notifications
-	OnScreenshot       func(studentID string, jpegData []byte)
+	OnScreenshot       func(studentID string, jpegData []byte, status string)
 	OnCommandFailed    func(nickname, action, errMsg string) // teacher-side: student reported failure after retries
 	OnRawMessage       func(protocol.Message)               // agent-side: forward every received message to TUI pipe
 
@@ -173,6 +177,7 @@ func (a *App) StartTeacher() error {
 	a.loadMessages()
 	a.loadLists()
 	a.loadFavorites()
+	a.Sched = NewScheduler()
 
 	srv := network.NewServer()
 
@@ -771,7 +776,7 @@ func (a *App) handleStudentMessage(st *network.Student, msg protocol.Message) {
 			return
 		}
 		if a.OnScreenshot != nil {
-			a.OnScreenshot(payload.StudentID, payload.Data)
+			a.OnScreenshot(payload.StudentID, payload.Data, payload.Status)
 		}
 	}
 }

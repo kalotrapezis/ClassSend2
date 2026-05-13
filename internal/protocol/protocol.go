@@ -133,7 +133,13 @@ type FileEndPayload struct {
 
 type ScreenshotPayload struct {
 	StudentID string `json:"sid"`
-	Data      []byte `json:"data"` // JPEG bytes
+	Data      []byte `json:"data"` // JPEG bytes; empty when Status="load"
+	// Status: "" or "ok" = normal screenshot in Data.
+	//        "load"     = student PC is overloaded; Data is empty; teacher
+	//                     should keep its existing thumbnail and just bump
+	//                     lastSeen so the cell isn't marked offline.
+	// JSON-omitempty so old clients/servers see no change in normal frames.
+	Status string `json:"status,omitempty"`
 }
 
 type ScreenCastPayload struct {

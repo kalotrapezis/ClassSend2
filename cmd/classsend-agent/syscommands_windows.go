@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -308,6 +309,7 @@ var font5x7 = map[rune][7]byte{
 	'H': {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
 	'I': {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
 	'L': {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+	'M': {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
 	'N': {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
 	'O': {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
 	'P': {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
@@ -347,16 +349,24 @@ func drawText(img *image.RGBA, s string, px, py, scale int, fg color.RGBA) {
 
 var (
 	placeholderMu    sync.Mutex
-	placeholderCache = map[int][]byte{} // key: maxEdge encodes both size+quality bucket
+	placeholderCache = map[string][]byte{} // key: msg+"|"+maxEdge
 )
 
 // makeFailurePlaceholder returns a JPEG showing "TECHNICAL DIFFICULTIES" on
-// an amber/black hazard background. Cached per maxEdge — same bytes are
-// returned every time so we don't re-encode on every failed capture.
+// an amber/black hazard background. Used when BitBlt produced a zero buffer
+// (hybrid-GPU machines) — distinguishes a real broken-capture from a
+// student who happens to have a black wallpaper.
 func makeFailurePlaceholder(maxEdge, quality int) []byte {
+	return makeBannerPlaceholder("TECHNICAL DIFFICULTIES", maxEdge, quality)
+}
+
+// makeBannerPlaceholder is the shared renderer for placeholder JPEGs. Cached
+// per (msg, maxEdge) so callers can spam without hitting the encoder.
+func makeBannerPlaceholder(msg string, maxEdge, quality int) []byte {
+	key := msg + "|" + strconv.Itoa(maxEdge)
 	placeholderMu.Lock()
 	defer placeholderMu.Unlock()
-	if b, ok := placeholderCache[maxEdge]; ok {
+	if b, ok := placeholderCache[key]; ok {
 		return b
 	}
 
@@ -397,7 +407,6 @@ func makeFailurePlaceholder(maxEdge, quality int) []byte {
 	}
 
 	// Center the message.
-	const msg = "TECHNICAL DIFFICULTIES"
 	scale := w / 200
 	if scale < 2 {
 		scale = 2
@@ -416,7 +425,7 @@ func makeFailurePlaceholder(maxEdge, quality int) []byte {
 		return nil
 	}
 	out := buf.Bytes()
-	placeholderCache[maxEdge] = out
+	placeholderCache[key] = out
 	return out
 }
 
@@ -453,6 +462,15 @@ func sampleLumaBGRA(raw []byte, w, h int) int {
 }
 
 func captureScreenSized(maxEdge int, quality int) ([]byte, error) {
+	// Load short-circuit: skip the whole GetDC/CreateDIBSection/BitBlt path on
+	// an overloaded PC. Returns an error so callers drop the frame entirely;
+	// the OnCommand path catches isUnderLoad() earlier and sends a
+	// Status="load" frame to the teacher instead.
+	if isUnderLoad() {
+		devlog.Logf("capture: skipped (system under load)  cpu=%d%% avail=%dMB",
+			lastCPUPct.Load(), lastMemMB.Load())
+		return nil, errAgentUnderLoad
+	}
 	ensureDPIAware()
 	t0 := time.Now()
 
@@ -1404,8 +1422,9 @@ const stressInflightLimit = 4
 
 var (
 	stressSem      = make(chan struct{}, stressInflightLimit)
-	stressBusyDrop atomic.Uint64
-	errAgentBusy   = errors.New("agent busy — command dropped")
+	stressBusyDrop    atomic.Uint64
+	errAgentBusy      = errors.New("agent busy — command dropped")
+	errAgentUnderLoad = errors.New("agent skipping capture — system under load")
 )
 
 // runGuarded wraps an async command handler. Tries to acquire a slot;
@@ -1496,6 +1515,28 @@ func setupStudentCommands(app *core.App, devMode bool) {
 		devlog.Logf("sendShot ok  jpeg=%dB", len(data))
 	}
 
+	// sendLoadStatus tells the teacher "I'm alive but overloaded — keep my
+	// previous thumbnail." No JPEG bytes, just a status frame. Teacher updates
+	// lastSeen (so the cell isn't marked offline) and skips the image paint.
+	sendLoadStatus := func() {
+		msg, err := protocol.Encode(protocol.TypeScreenshot, protocol.ScreenshotPayload{
+			StudentID: app.Hostname,
+			Status:    "load",
+		})
+		if err != nil {
+			devlog.Logf("sendLoadStatus encode failed: %v", err)
+			return
+		}
+		if app.Client == nil {
+			return
+		}
+		if sendErr := app.Client.Send(msg); sendErr != nil {
+			devlog.Logf("sendLoadStatus send failed: %v", sendErr)
+			return
+		}
+		devlog.Logf("sendLoadStatus ok  cpu=%d%% avail=%dMB", lastCPUPct.Load(), lastMemMB.Load())
+	}
+
 	report := func(cmd protocol.CommandPayload, err error) {
 		app.SendCmdAck(cmd.CmdID, cmd.Action, err)
 	}
@@ -1573,6 +1614,15 @@ func setupStudentCommands(app *core.App, devMode bool) {
 			// Empty / anything else => normal thumbnail.
 			hires := cmd.Param == "hi"
 			devlog.Logf("CmdRequestShot received  hi=%v", hires)
+			// Load short-circuit: skip the capture entirely on overloaded PCs
+			// and tell the teacher to keep the previous thumbnail. Same intent
+			// as the technical-difficulties placeholder, but the teacher won't
+			// replace the existing image — so the kid's pre-overload screen
+			// stays visible until they actually recover.
+			if isUnderLoad() {
+				runGuarded(app, cmd, sendLoadStatus)
+				return
+			}
 			runGuarded(app, cmd, func() {
 				var (
 					data []byte

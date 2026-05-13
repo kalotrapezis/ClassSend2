@@ -526,6 +526,26 @@ func StartSession(
 					lastStudents = current
 				}
 
+				// Load short-circuit: the student PC is overloaded and chose
+				// to skip its capture this round. Bump lastSeen (so the cell
+				// isn't marked offline) and don't repaint — the previous
+				// thumbnail stays. No retry: the agent's next CmdRequestShot
+				// will either capture normally or skip again on its own.
+				if shot.Status == "load" {
+					stateMu.Lock()
+					s, ok := states[shot.StudentID]
+					if !ok {
+						s = &studentState{}
+						states[shot.StudentID] = s
+					}
+					s.outstanding = 0
+					s.nextOK = time.Time{}
+					s.lastSeen = time.Now()
+					stateMu.Unlock()
+					devlog.Logf("monitoring: shot suppressed (under load)  student=%s", shot.StudentID)
+					break
+				}
+
 				// Filter all-black frames — but only when the cell already
 				// has a good thumbnail to keep showing. A brand-new cell
 				// whose first capture is black still gets painted (better
@@ -753,6 +773,11 @@ func waitForShot(ch <-chan ShotMsg, hostname string, timeout time.Duration, stop
 	for {
 		select {
 		case shot := <-ch:
+			if shot.Status == "load" {
+				// Overloaded — focus-mode caller treats this as "no shot
+				// this round" so the focus pane keeps the last frame.
+				continue
+			}
 			if shot.StudentID == hostname {
 				return shot.Data
 			}
@@ -787,6 +812,11 @@ func waitForShotDispatch(
 	for {
 		select {
 		case shot := <-ch:
+			if shot.Status == "load" {
+				// Overloaded student — skip. The main grid loop is the one
+				// that owns lastSeen bookkeeping; here we just ignore it.
+				continue
+			}
 			if shot.StudentID == target {
 				return shot.Data
 			}

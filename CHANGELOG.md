@@ -11,6 +11,55 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 ### Planned
 - Custom-built minimal ffmpeg (libx264 + mp4 mux + rawvideo demux only). The currently-bundled BtbN GPL build is statically-linked but full-featured — ~200 MB on disk. A purpose-built minimal would be 10-15 MB; the installer would shrink from 60 MB back toward ~30 MB.
 - Optional hardware encoder selection (`h264_nvenc` / `h264_qsv` / `h264_amf`) with auto-detection. v0.0.7 still uses libx264 universally — works everywhere, ~10-15% CPU at 1080p30 on a modest i5.
+- Persistent scheduled jobs. v0.2.0 keeps the scheduler entirely in teacher-process memory; jobs are lost on restart. The `Scheduler.List()` / `Add()` API is the surface a future implementation would back with `sched.json` in `DataDir`.
+- External watchdog (Task Scheduler entry "at logon + every 5 min, start agent if not running") as a belt-and-braces complement to the in-process load monitor.
+
+---
+
+## [0.2.0] — 2026-05-13
+
+The "lessons can plan ahead" release. Three threads landed together in one classroom-driven session: a scheduling system for tool commands, a system-load safe mode for the agent so an overloaded student PC stops dragging the rest of the grid down, and a handful of UX fixes the user spotted during a real lesson on 11 freshly-installed potato PCs.
+
+### Added
+
+#### Scheduling — `--t … | HH:MM` / `… | :NN`
+
+- **Time-clause on tool commands.** Any `--t <action>` can take a `| <when>` suffix to schedule. Two syntaxes:
+  - `| HH:MM` — absolute 24h clock time today (e.g. `--t shutdown >* | 13:15`).
+  - `| :NN` — NN minutes from now (e.g. `--t sd | :30`).
+- **Lock-with-duration.** `--t lock >* | :15` locks the class **immediately** and schedules the paired unlock at +15 min. The pipe-after-lock semantics differ deliberately from other actions (where `:NN` means "fire at +NN") because "lock the class for the next 15 minutes" is the actual classroom verb. `--t lock >* | 09:30` retains the absolute meaning — lock fires at 09:30 and stays locked.
+- **Tab default after bare `|`.** `--t shutdown >* |<Tab>` completes to `… | :3`; `--t lock >* |<Tab>` completes to `… | :15`. One-keystroke "lock the class for 15 minutes."
+- **Past-time confirmation flow.** Typing `--t lock >* | 09:00` after 09:00 doesn't silently roll to tomorrow — the TUI surfaces `⚠ Η ώρα 09:00 έχει περάσει σήμερα. Προγραμματισμός για αύριο Wed 09:00; (--y / --n)` and parks the command in `pendingSchedule`. `--y` schedules for tomorrow, `--n` cancels. Any other input also cancels (and runs as-typed — natural "I changed my mind, do this instead" flow).
+- **`--sched` family.** `--sched` (or `--schedule` / `--sch`) lists pending jobs with stable IDs (`S1`, `S2`, …). `--sched cancel S1` removes one. The scheduler's `Fire` callback runs `app.SendCommand(…)` exactly as if the teacher had typed it at that moment, then pushes a `⏰ Εκτελέστηκε [S1] …` line to the chat scroll so the firing is visible without opening `--sched`.
+- **Schedulable actions** are the ones where time-shifting makes sense: `lock`, `unlock`, `mute`, `unmute`, `shutdown`, `close`, `block`, `unblock`, `launch`, `tvon`, `tvoff`. Deliberately excluded: `focus` (a scheduled focus is meaningless), `shot` (one-frame snapshot — no value delayed), and the cast family (binds to the teacher's screen, fragile to schedule).
+- **Persistence: none.** Jobs live in `Scheduler.jobs` in the teacher process and die with it. The user explicitly framed this as the foundation for a later schedule manager — see the Unreleased section above for the follow-up.
+
+#### System-load safe mode for the agent
+
+- **Background load monitor** ([cmd/classsend-agent/load_windows.go](cmd/classsend-agent/load_windows.go)). Ticks every 2 s sampling `GetSystemTimes` (system-wide CPU%) and `GlobalMemoryStatusEx` (available physical MB). Maintains an atomic `loadIsCritical` boolean with hysteresis: enters CRITICAL when CPU stays at ≥98% for 6 s **or** available memory drops to ≤150 MB for 4 s; exits when CPU is ≤85% for 6 s **and** memory is ≥300 MB for 4 s. Thresholds are deliberately permissive — the deployment target is 8-year-old classroom PCs that idle at 50-70% CPU under normal load; anything less aggressive would mark them CRITICAL permanently.
+- **Capture short-circuit.** When CRITICAL, `CmdRequestShot` in the agent skips the entire `GetDC` / `CreateDIBSection` / `BitBlt` path and sends a `ScreenshotPayload{Status:"load"}` frame with empty `Data` instead. No GPU contention, no JPEG encode, no fighting with whatever's already saturating the box. `captureScreenSized` itself returns `errAgentUnderLoad` as a defense-in-depth shortcut for any future caller.
+- **Teacher keeps last good thumbnail.** Receiving a `Status:"load"` frame updates `lastSeen` on the monitoring cell (so it isn't marked offline at the 30 s timer) but **doesn't repaint** — the cell keeps showing whatever the kid's screen looked like before the load spike. Goal per the user's wording: "at the beginning when no other program will run it will send a pic. So we have one, just don't replace it, until the next one." When the PC recovers, the next normal screenshot overwrites the stale frame.
+- **Transitions logged, steady state silent.** The agent devlog records `load-monitor: ENTER critical reason=cpu cpu=99% avail=820MB` and `EXIT critical …` per transition, plus `capture: skipped (system under load)` on each shot the agent declined to take. Reviewing a `--bug` zip after a tough lesson will show exactly when each PC went hot and when it cooled.
+
+#### Path Notes — pin shortcut
+
+- **`s` in the `^N` overlay pins / unpins the highlighted entry** ([internal/core/favorites.go](internal/core/favorites.go), [internal/tui/model.go](internal/tui/model.go) `favoritesTogglePinSelected`). Pinned entries get a `★` marker, sort above the non-pinned recency block, and are exempt from the 50-entry cap (i.e. pinned classroom apps survive even as the teacher accumulates 50+ recent push-opens). New `FavoriteEntry.Pinned` field is JSON-`omitempty` so on-disk format is unchanged for unpinned entries; legacy `favorites.json` loads without migration.
+
+### Changed
+
+- **`ScreenshotPayload` gains a `Status` field** ([internal/protocol/protocol.go](internal/protocol/protocol.go)). `""` / `"ok"` = a normal screenshot is in `Data` (the existing semantics); `"load"` = the student PC is overloaded and `Data` is empty. The field is JSON-`omitempty` so wire frames from normal screenshots are byte-identical to v0.1.0. Old teachers receiving a `"load"` frame from a new agent would see an empty `Data` byte slice and (depending on path) either skip the cell or paint a black thumbnail — recommend upgrading both sides together for clean behaviour.
+- **`OnScreenshot` callback signature** gains a `status string` parameter so the load state can flow through to the monitoring session. Internal API, no protocol implications.
+- **Favorites sort algorithm** ([internal/core/favorites.go](internal/core/favorites.go) `sortFavorites` / `trimFavorites`). Was a single `AddedAt`-descending sort with a hard cap on tail; now sorts pinned-first then recency-within-group, and the cap trim drops non-pinned tail before touching pinned. If pinned alone exceed the cap, all pinned are kept (cap is soft w.r.t. pins).
+
+### Fixed
+
+- **Path Notes inserted quoted URL that Windows couldn't open.** Selecting `google.gr` from the `^N` overlay produced `--op "google.gr" >`, which `parsePushOpenCmd` was splitting with `strings.Fields` — leaving the literal `"` characters on the target. The agent then asked Windows to open a protocol named `"google.gr"` and got nothing. Two-part fix: `splitQuoted` parser handles `"…"` as a single token across whitespace boundaries (so paths-with-spaces still survive), and the overlay's `favoritesPlaceSelected` only wraps in `"` when the value actually contains whitespace. Regression test in [internal/tui/push_open_test.go](internal/tui/push_open_test.go) pins 8 cases including the exact `"google.gr"` scenario.
+
+### Notes
+
+- **Protocol compatibility.** v0.2.0 is wire-compatible with v0.1.0 for normal screenshot frames. New `"load"` status frames are interpreted only by v0.2.0 teachers; older teachers fall through to whatever the existing "empty data" path does (typically "skip", which is benign). Mixed-version classrooms work — recommend upgrading the agent + teacher together to get the load-safe-mode behaviour end-to-end.
+- **Scheduler is teacher-side only.** Students see scheduled commands arrive as normal command frames at fire time; nothing on the wire indicates "this was scheduled." Same payload, same execution path.
+- **Load monitor thresholds live as constants** at the top of `startLoadMonitor` in [cmd/classsend-agent/load_windows.go](cmd/classsend-agent/load_windows.go). If a particular deployment finds the defaults wrong, change them and rebuild — there's no settings.json knob in v0.2.0. The numbers are calibrated for the 11 classroom PCs the user installed this build on in 15 minutes.
 
 ---
 
