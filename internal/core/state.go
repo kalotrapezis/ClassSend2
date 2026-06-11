@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -827,7 +826,7 @@ func (a *App) handleTeacherMessage(msg protocol.Message) {
 		if payload.Action == protocol.CmdPushOpen {
 			// Agent executes this; TUI in agent-backed mode skips re-execution
 			if a.agentConn == nil {
-				go exec.Command("cmd", "/c", "start", "", payload.Param).Start()
+				go openDefault(payload.Param) //nolint:errcheck
 			}
 			return
 		}
@@ -1440,7 +1439,7 @@ func (a *App) assembleAndStore(fileID string, pf *pendingFile) {
 	if pf.autoOpen {
 		// Silently open with default app — no UI notification
 		path := a.GetFilePath(fileID, pf.name)
-		exec.Command("cmd", "/c", "start", "", path).Start()
+		openDefault(path) //nolint:errcheck
 	}
 	if a.OnFileReceived != nil {
 		a.OnFileReceived(fileID, pf.name)

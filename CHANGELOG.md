@@ -16,6 +16,28 @@ ClassSend2 adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.3-Linux] — 2026-06-11
+
+First-class Linux support: the teacher console, the student chat TUI and the
+background agent all build and run on Linux, with native packaging for both
+Debian-family (Mint/Ubuntu) and Fedora/RHEL. Includes a cross-platform TUI
+rendering fix.
+
+### Fixed
+
+- **Ghost frames / "everything pushed up" in the teacher TUI** ([internal/tui/model.go](internal/tui/model.go) `renderBottomBar`, `viewChat`). On a classroom-width terminal the 11-entry shortcut bar wrapped onto a second line, making `View()` one row taller than the screen; in alt-screen mode that scrolls the frame and strands a copy of the previous render (e.g. the tail of the old student sidebar) in scrollback — which read as "two different groupings". The bar is now capped at one line (`MaxHeight(1)`), the staged-file row is budgeted into the layout, and the composed view is clamped to the terminal height as a backstop. Regression test in [internal/tui/layout_test.go](internal/tui/layout_test.go).
+- **Push-open and silent file auto-open were Windows-only** ([internal/core/state.go](internal/core/state.go), new [internal/core/open.go](internal/core/open.go)). `CmdPushOpen` and auto-open shelled out to `cmd /c start`, a no-op on Linux. Now routed through `openDefault` → `xdg-open` (Linux) / `open` (macOS) / `cmd /c start` (Windows).
+
+### Added
+
+- **Linux agent + binaries** ([build-linux.sh](build-linux.sh), [cmd/classsend-agent/syscommands_linux.go](cmd/classsend-agent/syscommands_linux.go)). The Linux backend implements lock (`loginctl`), mute (`pactl`), launch/focus/close, screenshots, the monitoring banner (`notify-send`) and cast viewing (`mpv`). Build produces CGO-free static amd64 `classsend-agent`, `student` and `teacher`.
+- **Teacher screen casting on Linux** ([cmd/classsend/syscommands_teacher_linux.go](cmd/classsend/syscommands_teacher_linux.go)). `ffmpeg -f x11grab` → H.264 → the same fragmented-MP4 wire format as Windows, reusing `FMP4Splitter` / `CastServer`. Encoder auto-selects `libx264`, falling back to `libopenh264` (Fedora's default `ffmpeg-free`). X11 only — Wayland's capture-consent model rules out unattended casting. Integration-tested against real ffmpeg in [internal/network/fmp4_ffmpeg_linux_test.go](internal/network/fmp4_ffmpeg_linux_test.go).
+- **Wayland-aware screenshots** (`screenshotTools`). Tries `gnome-screenshot` → `spectacle` → `grim` before the X11-only `scrot`/`import`, so the monitoring grid works on Fedora KDE/GNOME Wayland.
+- **Window control across X11 and Wayland** (`focusApp` / `closeVisibleApps`). Close runs a cascade — `wmctrl` for X11/Xwayland windows, then KWin's "Window Close" global shortcut via `kglobalaccel` for native-Wayland windows (the reliable lever after Plasma 6 disabled the D-Bus `loadScript` trick). Focus uses `wmctrl` (works for X11/Xwayland apps under either session).
+- **Fedora + Debian packaging** ([setup/](setup/)). `install.sh` (generic, package-manager-aware dependency hints), `install-teacher.sh`, `uninstall.sh`, `package-deb.sh` (.deb for Mint/Debian) and `package-rpm.sh` (.rpm for Fedora/RHEL). Adds `xdg-utils` to the runtime deps.
+
+---
+
 ## [0.2.2] — 2026-05-13
 
 A small UX polish release on top of 0.2.1, plus a rebuild of the Win7 agent so legacy student PCs finally pick up the v0.2.0 system-load safe-mode protection.
