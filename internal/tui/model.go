@@ -581,6 +581,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if m.app.Role == core.RoleTeacher && m.stagedFile != "" {
 				staged := m.stagedFile
 				m.stagedFile = ""
+				m.resizeComponents() // staged row removed — reclaim its budget
 				if err := m.app.SendFile(staged, "", "", true); err != nil {
 					m.pushSysMsg("⚠ " + err.Error())
 				} else {
@@ -609,6 +610,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.filePickerOpen = false
 		} else if m.stagedFile != "" {
 			m.stagedFile = ""
+			m.resizeComponents() // staged row removed — reclaim its budget
 		} else {
 			m.toolsOpen = false
 		}
@@ -1238,6 +1240,7 @@ func (m *Model) trySend() tea.Cmd {
 		}
 
 		m.stagedFile = ""
+		m.resizeComponents() // staged row removed — reclaim its budget
 		if err := m.app.SendFile(staged, caption, targetID, autoOpen); err != nil {
 			m.pushSysMsg("⚠ " + err.Error())
 			return nil
@@ -2323,7 +2326,10 @@ func (m *Model) resizeComponents() {
 		sideW = 22
 	}
 	chatW := m.width - sideW
-	bottomH := 4 // input + bottom bar
+	bottomH := 4 // input box (border + 2 rows) + bottom bar
+	if m.stagedFile != "" {
+		bottomH++ // staged-file (📎) row sits above the input box
+	}
 	headerH := 1
 	pinnedH := m.pinnedSectionHeight()
 	vpH := m.height - bottomH - headerH - pinnedH
@@ -2451,6 +2457,13 @@ func (m *Model) viewChat() string {
 	if m.listOpen {
 		view = m.overlayList(view)
 	}
+	// Final guard: never emit more rows than the terminal has. A frame taller
+	// than the screen scrolls the alt-screen buffer and leaves ghost lines from
+	// the previous render (duplicated sidebar / "everything pushed up"). Clamp
+	// so any future layout miscalculation degrades gracefully instead.
+	if m.height > 0 {
+		view = lipgloss.NewStyle().MaxHeight(m.height).Render(view)
+	}
 	return view
 }
 
@@ -2577,8 +2590,15 @@ func (m *Model) renderBottomBar() string {
 	}
 
 	bar := strings.Join(parts, "  ")
+	// MaxHeight(1) is load-bearing: on a narrow classroom screen the shortcut
+	// list is wider than the terminal, and a fixed Width() makes lipgloss wrap
+	// it onto a 2nd line. The layout budgets exactly one row for this bar, so an
+	// extra line overflows View() past the terminal height — in alt-screen mode
+	// that scrolls the frame and leaves a ghost of the previous render (e.g. the
+	// tail of the old sidebar) stuck in scrollback. Cap the bar at one line.
 	return lipgloss.NewStyle().
 		Width(m.width).
+		MaxHeight(1).
 		Background(colPanel).
 		Foreground(colTextDim).
 		Padding(0, 1).
@@ -2746,6 +2766,7 @@ func (m *Model) filePickerEnter() {
 	// It's a file — stage it
 	m.stagedFile = full
 	m.filePickerOpen = false
+	m.resizeComponents() // staged row changes the layout budget
 }
 
 func (m *Model) filePickerBack() {
@@ -2777,6 +2798,7 @@ func (m *Model) stageFileByPath(raw string) {
 		return
 	}
 	m.stagedFile = abs
+	m.resizeComponents() // staged row changes the layout budget
 	m.pushSysMsg(fmt.Sprintf("📎 Σταδιακά: %s — Enter για αποστολή", filepath.Base(abs)))
 }
 
