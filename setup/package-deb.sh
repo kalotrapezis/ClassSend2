@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
-# Build a .deb for the ClassSend 2 STUDENT bundle. Run on a Debian-family box
-# (Linux Mint / Ubuntu 22.04+) — dpkg-deb is required and is not present on
-# Fedora. For Fedora/RHEL use setup/package-rpm.sh instead.
+# Build .deb packages for ClassSend 2. Two packages, for the two machine roles:
+#
+#   classsend2          — student bundle: background agent (autostarts) + chat TUI
+#   classsend2-teacher  — teacher console (no agent, no autostart)
+#
+# Run on a Debian-family box (Mint/Ubuntu) for native dpkg-deb, or anywhere with
+# binutils (ar) + tar — the script falls back to assembling the .deb by hand, so
+# it works on Fedora too. For RPMs use setup/package-rpm.sh.
 #
 # Usage:
-#   ./setup/package-deb.sh           # VERSION from build.bat
-#   VERSION=0.2.2 ./setup/package-deb.sh
+#   ./setup/package-deb.sh [student|teacher|both]   # default: both
+#   VERSION=0.2.3 ./setup/package-deb.sh teacher
 #
 # Inputs (produced by ./build-linux.sh):
 #   dist/linux/classsend-agent-linux-amd64
 #   dist/linux/student-linux-amd64
+#   dist/linux/teacher-linux-amd64
 #   dist/linux/about.md
 #
 # Output:
 #   dist/linux/classsend2_<VERSION>_amd64.deb
+#   dist/linux/classsend2-teacher_<VERSION>_amd64.deb
 
 set -euo pipefail
 
@@ -32,28 +39,68 @@ if [[ -z "$VERSION" ]]; then
     exit 1
 fi
 
+ROLE="${1:-both}"
 DIST="$ROOT/dist/linux"
-AGENT_BIN="$DIST/classsend-agent-linux-amd64"
-TUI_BIN="$DIST/student-linux-amd64"
-ABOUT="$DIST/about.md"
-for f in "$AGENT_BIN" "$TUI_BIN" "$ABOUT"; do
-    [[ -f "$f" ]] || { echo "ERROR: missing $f — run ./build-linux.sh first" >&2; exit 1; }
-done
 
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+require() { [[ -f "$1" ]] || { echo "ERROR: missing $1 — run ./build-linux.sh first" >&2; exit 1; }; }
 
-PKG="$STAGE/classsend2_${VERSION}_amd64"
-mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/classsend2" \
-         "$PKG/usr/share/applications" "$PKG/etc/xdg/autostart"
+# assemble_deb <staged-pkg-dir> <output.deb> — uses dpkg-deb if present, else
+# hand-rolls the ar archive (debian-binary + control.tar.gz + data.tar.gz).
+assemble_deb() {
+    local PKG="$1" OUT="$2"
+    if command -v dpkg-deb >/dev/null 2>&1; then
+        dpkg-deb --build --root-owner-group "$PKG" "$OUT" >/dev/null
+    else
+        local TMP; TMP=$(mktemp -d)
+        echo "2.0" > "$TMP/debian-binary"
+        tar --owner=root --group=root -czf "$TMP/control.tar.gz" -C "$PKG/DEBIAN" .
+        tar --owner=root --group=root -czf "$TMP/data.tar.gz" -C "$PKG" --exclude=./DEBIAN .
+        rm -f "$OUT"
+        ( cd "$TMP" && ar rc "$OUT" debian-binary control.tar.gz data.tar.gz )
+        rm -rf "$TMP"
+    fi
+    echo "Built: $OUT"
+}
 
-install -m 0755 "$AGENT_BIN" "$PKG/usr/bin/classsend-agent"
-install -m 0755 "$TUI_BIN"   "$PKG/usr/bin/classsend"
-install -m 0644 "$ABOUT"     "$PKG/usr/share/classsend2/about.md"
+make_student_deb() {
+    require "$DIST/classsend-agent-linux-amd64"
+    require "$DIST/student-linux-amd64"
+    require "$DIST/about.md"
 
-SIZE_KB=$(du -sk "$PKG/usr" | cut -f1)
+    local STAGE; STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' RETURN
+    local PKG="$STAGE/pkg"
+    mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/classsend2" \
+             "$PKG/usr/share/applications" "$PKG/etc/xdg/autostart"
 
-cat > "$PKG/DEBIAN/control" <<EOF
+    install -m 0755 "$DIST/classsend-agent-linux-amd64" "$PKG/usr/bin/classsend-agent"
+    install -m 0755 "$DIST/student-linux-amd64"         "$PKG/usr/bin/classsend"
+    install -m 0644 "$DIST/about.md"                    "$PKG/usr/share/classsend2/about.md"
+
+    cat > "$PKG/usr/share/applications/classsend.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=ClassSend
+Comment=Chat with your teacher
+Exec=classsend
+Icon=utilities-terminal
+Categories=Education;
+Terminal=true
+EOF
+
+    cat > "$PKG/etc/xdg/autostart/classsend-agent.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=ClassSend Agent
+Comment=ClassSend 2 student-side background agent
+Exec=/usr/bin/classsend-agent
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+Terminal=false
+EOF
+
+    local SIZE_KB; SIZE_KB=$(du -sk "$PKG/usr" | cut -f1)
+    cat > "$PKG/DEBIAN/control" <<EOF
 Package: classsend2
 Version: $VERSION
 Section: education
@@ -69,63 +116,62 @@ Description: ClassSend 2 — student-side classroom agent
  executes class commands (lock, mute, screenshot, screen cast viewer,
  monitoring notification). The TUI provides chat with the teacher.
 EOF
+    printf '#!/bin/sh\nset -e\nexit 0\n' > "$PKG/DEBIAN/postinst"
+    printf '#!/bin/sh\nset -e\npkill -x classsend-agent 2>/dev/null || true\nexit 0\n' > "$PKG/DEBIAN/prerm"
+    chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm"
 
-cat > "$PKG/usr/share/applications/classsend.desktop" <<'EOF'
+    assemble_deb "$PKG" "$DIST/classsend2_${VERSION}_amd64.deb"
+}
+
+make_teacher_deb() {
+    require "$DIST/teacher-linux-amd64"
+    require "$DIST/about.md"
+
+    local STAGE; STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' RETURN
+    local PKG="$STAGE/pkg"
+    mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/classsend2" \
+             "$PKG/usr/share/applications"
+
+    install -m 0755 "$DIST/teacher-linux-amd64" "$PKG/usr/bin/classsend-teacher"
+    install -m 0644 "$DIST/about.md"            "$PKG/usr/share/classsend2/about.md"
+
+    cat > "$PKG/usr/share/applications/classsend-teacher.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application
-Name=ClassSend
-Comment=Chat with your teacher
-Exec=x-terminal-emulator -e classsend
+Name=ClassSend Teacher
+Comment=Run the ClassSend 2 classroom console
+Exec=classsend-teacher
 Icon=utilities-terminal
 Categories=Education;
-Terminal=false
+Terminal=true
 EOF
-chmod 0644 "$PKG/usr/share/applications/classsend.desktop"
 
-cat > "$PKG/etc/xdg/autostart/classsend-agent.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=ClassSend Agent
-Comment=ClassSend 2 student-side background agent
-Exec=/usr/bin/classsend-agent
-Hidden=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
-Terminal=false
+    local SIZE_KB; SIZE_KB=$(du -sk "$PKG/usr" | cut -f1)
+    cat > "$PKG/DEBIAN/control" <<EOF
+Package: classsend2-teacher
+Version: $VERSION
+Section: education
+Priority: optional
+Architecture: amd64
+Installed-Size: $SIZE_KB
+Maintainer: Theologos Kalotrapezis <kalotrapezis@gmail.com>
+Recommends: ffmpeg
+Description: ClassSend 2 — teacher console
+ The teacher-side classroom console for ClassSend 2: chat, file push,
+ scheduled commands, the live monitoring grid and screen casting (X11).
+ Runs in a terminal; launch with classsend-teacher. No background agent and
+ no autostart — install the classsend2 package (not this) on student PCs.
 EOF
-chmod 0644 "$PKG/etc/xdg/autostart/classsend-agent.desktop"
 
-cat > "$PKG/DEBIAN/postinst" <<'EOF'
-#!/bin/sh
-set -e
-exit 0
-EOF
-chmod 0755 "$PKG/DEBIAN/postinst"
+    assemble_deb "$PKG" "$DIST/classsend2-teacher_${VERSION}_amd64.deb"
+}
 
-cat > "$PKG/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
-set -e
-pkill -x classsend-agent 2>/dev/null || true
-exit 0
-EOF
-chmod 0755 "$PKG/DEBIAN/prerm"
-
-OUT="$DIST/classsend2_${VERSION}_amd64.deb"
-if command -v dpkg-deb >/dev/null 2>&1; then
-    dpkg-deb --build --root-owner-group "$PKG" "$OUT"
-else
-    # Fallback for non-Debian hosts (e.g. Fedora): a .deb is just an `ar`
-    # archive of debian-binary + control.tar.gz + data.tar.gz, in that order.
-    # dpkg/apt accept a plain GNU-ar archive, so binutils is all we need.
-    echo "dpkg-deb not found — assembling .deb with ar + tar"
-    echo "2.0" > "$STAGE/debian-binary"
-    tar --owner=root --group=root -czf "$STAGE/control.tar.gz" -C "$PKG/DEBIAN" .
-    tar --owner=root --group=root -czf "$STAGE/data.tar.gz" -C "$PKG" --exclude=./DEBIAN .
-    rm -f "$OUT"
-    ( cd "$STAGE" && ar rc "$OUT" debian-binary control.tar.gz data.tar.gz )
-fi
+case "$ROLE" in
+    student) make_student_deb ;;
+    teacher) make_teacher_deb ;;
+    both)    make_student_deb; make_teacher_deb ;;
+    *) echo "usage: $0 [student|teacher|both]" >&2; exit 2 ;;
+esac
 
 echo
-echo "Built: $OUT"
-echo "Install with:  sudo apt install ./$(basename "$OUT")"
-echo "Inspect with:  dpkg-deb --contents $OUT"
+echo "Install with:  sudo apt install ./dist/linux/<file>.deb"

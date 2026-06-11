@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Build an .rpm for the ClassSend 2 STUDENT bundle. Run on Fedora / RHEL /
-# openSUSE — needs rpmbuild (Fedora: `sudo dnf install rpm-build`). For
-# Debian/Mint use setup/package-deb.sh instead.
+# Build .rpm packages for ClassSend 2. Two packages, for the two machine roles:
+#
+#   classsend2          — student bundle: background agent (autostarts) + chat TUI
+#   classsend2-teacher  — teacher console (no agent, no autostart)
+#
+# Run on Fedora / RHEL / openSUSE — needs rpmbuild (Fedora: dnf install rpm-build).
+# For .deb use setup/package-deb.sh.
 #
 # Usage:
-#   ./setup/package-rpm.sh           # VERSION from build.bat
-#   VERSION=0.2.2 ./setup/package-rpm.sh
+#   ./setup/package-rpm.sh [student|teacher|both]   # default: both
+#   VERSION=0.2.3 ./setup/package-rpm.sh teacher
 #
 # Inputs (produced by ./build-linux.sh):
 #   dist/linux/classsend-agent-linux-amd64
 #   dist/linux/student-linux-amd64
+#   dist/linux/teacher-linux-amd64
 #   dist/linux/about.md
 #
 # Output:
-#   dist/linux/classsend2-<VERSION>-1.x86_64.rpm
+#   dist/linux/classsend2-<VERSION>-1.<dist>.x86_64.rpm
+#   dist/linux/classsend2-teacher-<VERSION>-1.<dist>.x86_64.rpm
 
 set -euo pipefail
 
@@ -31,39 +37,39 @@ if [[ -z "$VERSION" ]]; then
     echo "ERROR: could not determine VERSION (set VERSION=… or pass via env)" >&2
     exit 1
 fi
-# RPM versions can't contain '-'; map any pre-release suffix into the release.
-RPM_VERSION="${VERSION//-/_}"
+RPM_VERSION="${VERSION//-/_}" # rpm versions can't contain '-'
 
+ROLE="${1:-both}"
 DIST="$ROOT/dist/linux"
 AGENT_BIN="$DIST/classsend-agent-linux-amd64"
-TUI_BIN="$DIST/student-linux-amd64"
+STUDENT_BIN="$DIST/student-linux-amd64"
+TEACHER_BIN="$DIST/teacher-linux-amd64"
 ABOUT="$DIST/about.md"
-for f in "$AGENT_BIN" "$TUI_BIN" "$ABOUT"; do
-    [[ -f "$f" ]] || { echo "ERROR: missing $f — run ./build-linux.sh first" >&2; exit 1; }
-done
 
-# ── Build a self-contained rpm tree (no ~/rpmbuild pollution) ─────────────────
-TOP=$(mktemp -d)
-trap 'rm -rf "$TOP"' EXIT
-mkdir -p "$TOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
+require() { [[ -f "$1" ]] || { echo "ERROR: missing $1 — run ./build-linux.sh first" >&2; exit 1; }; }
 
-SPEC="$TOP/SPECS/classsend2.spec"
-cat > "$SPEC" <<EOF
+# build_rpm <specfile> — builds in an isolated tree and copies the result to DIST.
+build_rpm() {
+    local SPEC="$1"
+    local TOP; TOP=$(mktemp -d)
+    mkdir -p "$TOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
+    rpmbuild --define "_topdir $TOP" -bb "$SPEC" >/dev/null
+    local OUT; OUT=$(find "$TOP/RPMS" -name '*.rpm' | head -1)
+    cp -f "$OUT" "$DIST/"
+    echo "Built: $DIST/$(basename "$OUT")"
+    rm -rf "$TOP"
+}
+
+make_student_rpm() {
+    require "$AGENT_BIN"; require "$STUDENT_BIN"; require "$ABOUT"
+    local SPEC; SPEC=$(mktemp --suffix=.spec)
+    cat > "$SPEC" <<EOF
 Name:           classsend2
 Version:        $RPM_VERSION
 Release:        1%{?dist}
 Summary:        ClassSend 2 — student-side classroom agent
 License:        Proprietary
-URL:            https://github.com/
 BuildArch:      x86_64
-
-# Fedora package names (apt equivalents in parentheses):
-#   mpv            cast viewer
-#   libnotify      notify-send banner            (libnotify-bin)
-#   glib2          gdbus to close notifications  (libglib2.0-bin)
-#   wmctrl         focus / close windows
-#   xdg-utils      xdg-open for push-open / file auto-open
-#   systemd        loginctl for screen lock
 Requires:       mpv, libnotify, glib2, wmctrl, xdg-utils, systemd
 Recommends:     gnome-screenshot
 Recommends:     pulseaudio-utils
@@ -74,32 +80,25 @@ The agent connects to a teacher PC over the local network and executes class
 commands (lock, mute, screenshot, screen cast viewer, monitoring notification).
 The TUI provides chat with the teacher.
 
-# Binaries are prebuilt and stripped-free; skip the default post-processing that
-# expects debug info / a build step.
 %global debug_package %{nil}
 %global __os_install_post %{nil}
 
 %install
-mkdir -p %{buildroot}/usr/bin
-mkdir -p %{buildroot}/usr/share/classsend2
-mkdir -p %{buildroot}/usr/share/applications
-mkdir -p %{buildroot}/etc/xdg/autostart
-
-install -m 0755 $AGENT_BIN %{buildroot}/usr/bin/classsend-agent
-install -m 0755 $TUI_BIN   %{buildroot}/usr/bin/classsend
-install -m 0644 $ABOUT     %{buildroot}/usr/share/classsend2/about.md
-
+mkdir -p %{buildroot}/usr/bin %{buildroot}/usr/share/classsend2 \\
+         %{buildroot}/usr/share/applications %{buildroot}/etc/xdg/autostart
+install -m 0755 $AGENT_BIN   %{buildroot}/usr/bin/classsend-agent
+install -m 0755 $STUDENT_BIN %{buildroot}/usr/bin/classsend
+install -m 0644 $ABOUT       %{buildroot}/usr/share/classsend2/about.md
 cat > %{buildroot}/usr/share/applications/classsend.desktop <<'DESK'
 [Desktop Entry]
 Type=Application
 Name=ClassSend
 Comment=Chat with your teacher
-Exec=x-terminal-emulator -e classsend
+Exec=classsend
 Icon=utilities-terminal
 Categories=Education;
-Terminal=false
+Terminal=true
 DESK
-
 cat > %{buildroot}/etc/xdg/autostart/classsend-agent.desktop <<'AUTO'
 [Desktop Entry]
 Type=Application
@@ -113,10 +112,7 @@ Terminal=false
 AUTO
 
 %preun
-# On full removal (not upgrade), stop a running agent.
-if [ \$1 -eq 0 ]; then
-    pkill -x classsend-agent 2>/dev/null || true
-fi
+if [ \$1 -eq 0 ]; then pkill -x classsend-agent 2>/dev/null || true; fi
 
 %files
 /usr/bin/classsend-agent
@@ -125,15 +121,60 @@ fi
 /usr/share/applications/classsend.desktop
 /etc/xdg/autostart/classsend-agent.desktop
 EOF
+    build_rpm "$SPEC"; rm -f "$SPEC"
+}
 
-rpmbuild --define "_topdir $TOP" -bb "$SPEC"
+make_teacher_rpm() {
+    require "$TEACHER_BIN"; require "$ABOUT"
+    local SPEC; SPEC=$(mktemp --suffix=.spec)
+    cat > "$SPEC" <<EOF
+Name:           classsend2-teacher
+Version:        $RPM_VERSION
+Release:        1%{?dist}
+Summary:        ClassSend 2 — teacher console
+License:        Proprietary
+BuildArch:      x86_64
+Recommends:     ffmpeg
 
-mkdir -p "$DIST"
-RPM_OUT=$(find "$TOP/RPMS" -name '*.rpm' | head -1)
-cp -f "$RPM_OUT" "$DIST/"
-FINAL="$DIST/$(basename "$RPM_OUT")"
+%description
+The teacher-side classroom console for ClassSend 2: chat, file push, scheduled
+commands, the live monitoring grid and screen casting (X11). Runs in a terminal;
+launch with classsend-teacher. No background agent and no autostart — install
+the classsend2 package (not this) on student PCs.
+
+%global debug_package %{nil}
+%global __os_install_post %{nil}
+
+%install
+mkdir -p %{buildroot}/usr/bin %{buildroot}/usr/share/classsend2 \\
+         %{buildroot}/usr/share/applications
+install -m 0755 $TEACHER_BIN %{buildroot}/usr/bin/classsend-teacher
+install -m 0644 $ABOUT        %{buildroot}/usr/share/classsend2/about.md
+cat > %{buildroot}/usr/share/applications/classsend-teacher.desktop <<'DESK'
+[Desktop Entry]
+Type=Application
+Name=ClassSend Teacher
+Comment=Run the ClassSend 2 classroom console
+Exec=classsend-teacher
+Icon=utilities-terminal
+Categories=Education;
+Terminal=true
+DESK
+
+%files
+/usr/bin/classsend-teacher
+/usr/share/classsend2/about.md
+/usr/share/applications/classsend-teacher.desktop
+EOF
+    build_rpm "$SPEC"; rm -f "$SPEC"
+}
+
+case "$ROLE" in
+    student) make_student_rpm ;;
+    teacher) make_teacher_rpm ;;
+    both)    make_student_rpm; make_teacher_rpm ;;
+    *) echo "usage: $0 [student|teacher|both]" >&2; exit 2 ;;
+esac
 
 echo
-echo "Built: $FINAL"
-echo "Install with:  sudo dnf install ./$(basename "$FINAL")"
-echo "Inspect with:  rpm -qlp $FINAL"
+echo "Install with:  sudo dnf install ./dist/linux/<file>.rpm"
