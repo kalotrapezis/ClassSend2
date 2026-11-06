@@ -110,6 +110,15 @@ func main() {
 		sendToTUI(ipc.Frame{Type: ipc.TypeForward, Data: raw})
 	}
 
+	// Without a student UI (Win7/8 installs ship the agent only) nobody would
+	// ever copy received files out of dataDir, so do it here.
+	if exe, err := os.Executable(); err == nil && !hasStudentUI(filepath.Dir(exe)) {
+		app.OnFileReceived = func(fileID, name string) {
+			dest, err := app.DownloadFile(fileID, name)
+			devlog.Logf("file received (no UI) name=%q dest=%q err=%v", name, dest, err)
+		}
+	}
+
 	if err := app.StartStudent(); err != nil {
 		log.Fatalf("start student: %v", err)
 	}
@@ -240,4 +249,15 @@ func dataDirectory() string {
 		appData, _ = os.UserHomeDir()
 	}
 	return filepath.Join(appData, "ClassSend")
+}
+
+// hasStudentUI reports whether the chat UI is installed next to the agent
+// (classsend[.exe] in installs, student[.exe] in dev installs).
+func hasStudentUI(dir string) bool {
+	for _, n := range []string{"classsend", "classsend.exe", "student", "student.exe"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err == nil {
+			return true
+		}
+	}
+	return false
 }

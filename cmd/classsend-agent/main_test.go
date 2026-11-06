@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -97,5 +99,18 @@ func TestWriteToTUI_NoInterleaving(t *testing.T) {
 		t.Fatalf("frame parse error (interleaved bytes): %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for frames")
+	}
+}
+
+func TestHasStudentUI(t *testing.T) {
+	dir := t.TempDir()
+	if hasStudentUI(dir) {
+		t.Fatal("empty dir: want false")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "classsend.exe"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !hasStudentUI(dir) {
+		t.Fatal("classsend.exe present: want true")
 	}
 }
