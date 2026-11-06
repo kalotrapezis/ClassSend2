@@ -1542,6 +1542,7 @@ func setupStudentCommands(app *core.App, devMode bool) {
 	}
 
 	app.OnCommand = func(cmd protocol.CommandPayload) {
+		devlog.Logf("cmd received  action=%s param=%q id=%s", cmd.Action, cmd.Param, cmd.CmdID)
 		switch cmd.Action {
 
 		case protocol.CmdLockScreen:
