@@ -88,15 +88,15 @@ func startLoadMonitor() {
 	// intentionally permissive: we'd rather let a slow PC limp along sending
 	// real shots than mark it CRITICAL on every busy moment.
 	const (
-		tickSec          = 2
-		cpuEnterPct      = 98 // CPU% to ENTER critical
-		cpuEnterTicks    = 3  // ≥ 6 s of near-pegged CPU
-		cpuExitPct       = 85 // CPU% to LEAVE critical
-		cpuExitTicks     = 3  // ≥ 6 s of clear breathing room
-		memEnterMB       = 150
-		memEnterTicks    = 2
-		memExitMB        = 300
-		memExitTicks     = 2
+		tickSec       = 2
+		cpuEnterPct   = 98 // CPU% to ENTER critical
+		cpuEnterTicks = 3  // ≥ 6 s of near-pegged CPU
+		cpuExitPct    = 85 // CPU% to LEAVE critical
+		cpuExitTicks  = 3  // ≥ 6 s of clear breathing room
+		memEnterMB    = 150
+		memEnterTicks = 2
+		memExitMB     = 300
+		memExitTicks  = 2
 	)
 
 	go func() {

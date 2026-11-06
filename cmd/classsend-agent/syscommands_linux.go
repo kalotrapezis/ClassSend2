@@ -829,4 +829,3 @@ func setupStudentCommands(app *core.App, devMode bool) {
 		}
 	}
 }
-

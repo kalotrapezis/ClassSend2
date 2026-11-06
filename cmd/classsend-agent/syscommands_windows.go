@@ -44,7 +44,7 @@ var (
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
 	procCreateDIBSection       = gdi32.NewProc("CreateDIBSection") // modern alternative to GetDIBits — direct memory pixels
-	procGdiFlush               = gdi32.NewProc("GdiFlush")          // commits pending GDI ops before reading DIBSection bits
+	procGdiFlush               = gdi32.NewProc("GdiFlush")         // commits pending GDI ops before reading DIBSection bits
 	procSelectObject           = gdi32.NewProc("SelectObject")
 	procBitBlt                 = gdi32.NewProc("BitBlt")
 	procDeleteObject           = gdi32.NewProc("DeleteObject")
@@ -52,20 +52,20 @@ var (
 	procGetDIBits              = gdi32.NewProc("GetDIBits")
 
 	// Window creation / management
-	procRegisterClassExW    = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
-	procShowWindow          = user32.NewProc("ShowWindow")
-	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procRegisterClassExW           = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW            = user32.NewProc("CreateWindowExW")
+	procShowWindow                 = user32.NewProc("ShowWindow")
+	procSetForegroundWindow        = user32.NewProc("SetForegroundWindow")
+	procSetWindowPos               = user32.NewProc("SetWindowPos")
 	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
-	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
-	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
-	procGetMessageW         = user32.NewProc("GetMessageW")
-	procTranslateMessage    = user32.NewProc("TranslateMessage")
-	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
-	procPostMessageW        = user32.NewProc("PostMessageW")
-	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
-	procGetConsoleWindow    = kernel32.NewProc("GetConsoleWindow")
+	procDefWindowProcW             = user32.NewProc("DefWindowProcW")
+	procPostQuitMessage            = user32.NewProc("PostQuitMessage")
+	procGetMessageW                = user32.NewProc("GetMessageW")
+	procTranslateMessage           = user32.NewProc("TranslateMessage")
+	procDispatchMessageW           = user32.NewProc("DispatchMessageW")
+	procPostMessageW               = user32.NewProc("PostMessageW")
+	procGetModuleHandleW           = kernel32.NewProc("GetModuleHandleW")
+	procGetConsoleWindow           = kernel32.NewProc("GetConsoleWindow")
 
 	// Registry
 	procRegCreateKeyExW  = advapi32.NewProc("RegCreateKeyExW")
@@ -76,23 +76,23 @@ var (
 	procRegCloseKey      = advapi32.NewProc("RegCloseKey")
 
 	// GDI drawing
-	procBeginPaint          = user32.NewProc("BeginPaint")
-	procEndPaint            = user32.NewProc("EndPaint")
-	procGetClientRect       = user32.NewProc("GetClientRect")
-	procFillRect            = user32.NewProc("FillRect")
-	procCreateSolidBrush    = gdi32.NewProc("CreateSolidBrush")
-	procSetTextColor        = gdi32.NewProc("SetTextColor")
-	procSetBkMode           = gdi32.NewProc("SetBkMode")
-	procDrawTextW           = user32.NewProc("DrawTextW")
-	procCreateFontW         = gdi32.NewProc("CreateFontW")
-	procInvalidateRect      = user32.NewProc("InvalidateRect")
-	procDestroyWindow       = user32.NewProc("DestroyWindow")
-	procIsZoomed            = user32.NewProc("IsZoomed")
-	procSetDIBits           = gdi32.NewProc("SetDIBits")
-	procStretchBlt          = gdi32.NewProc("StretchBlt")
-	procStretchDIBits       = gdi32.NewProc("StretchDIBits")
-	procSetStretchBltMode   = gdi32.NewProc("SetStretchBltMode")
-	procSetBrushOrgEx       = gdi32.NewProc("SetBrushOrgEx")
+	procBeginPaint        = user32.NewProc("BeginPaint")
+	procEndPaint          = user32.NewProc("EndPaint")
+	procGetClientRect     = user32.NewProc("GetClientRect")
+	procFillRect          = user32.NewProc("FillRect")
+	procCreateSolidBrush  = gdi32.NewProc("CreateSolidBrush")
+	procSetTextColor      = gdi32.NewProc("SetTextColor")
+	procSetBkMode         = gdi32.NewProc("SetBkMode")
+	procDrawTextW         = user32.NewProc("DrawTextW")
+	procCreateFontW       = gdi32.NewProc("CreateFontW")
+	procInvalidateRect    = user32.NewProc("InvalidateRect")
+	procDestroyWindow     = user32.NewProc("DestroyWindow")
+	procIsZoomed          = user32.NewProc("IsZoomed")
+	procSetDIBits         = gdi32.NewProc("SetDIBits")
+	procStretchBlt        = gdi32.NewProc("StretchBlt")
+	procStretchDIBits     = gdi32.NewProc("StretchDIBits")
+	procSetStretchBltMode = gdi32.NewProc("SetStretchBltMode")
+	procSetBrushOrgEx     = gdi32.NewProc("SetBrushOrgEx")
 
 	// Keyboard hook
 	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
@@ -129,31 +129,31 @@ const (
 	csHredraw          = 0x0002
 	csVredraw          = 0x0001
 
-	wmDestroy      = 0x0002
-	wmPaint        = 0x000F
-	wmSize         = 0x0005
-	wmClose        = 0x0010
-	wmKeydown      = 0x0100
-	wmSyskeydown   = 0x0104
-	wmLbuttondown  = 0x0201
-	wmRbuttondown  = 0x0204
-	wmMbuttondown  = 0x0207
+	wmDestroy       = 0x0002
+	wmPaint         = 0x000F
+	wmSize          = 0x0005
+	wmClose         = 0x0010
+	wmKeydown       = 0x0100
+	wmSyskeydown    = 0x0104
+	wmLbuttondown   = 0x0201
+	wmRbuttondown   = 0x0204
+	wmMbuttondown   = 0x0207
 	wmNclbuttondown = 0x00A1
 
-	hwndTopmost    = ^uintptr(0) // HWND_TOPMOST  = (HWND)(-1)
-	hwndNotopmost  = ^uintptr(1) // HWND_NOTOPMOST = (HWND)(-2)
+	hwndTopmost   = ^uintptr(0) // HWND_TOPMOST  = (HWND)(-1)
+	hwndNotopmost = ^uintptr(1) // HWND_NOTOPMOST = (HWND)(-2)
 
 	swHide     = 0
 	swMaximize = 3
 	swShow     = 5
 	swRestore  = 9
 
-	swpNomove    = 0x0002
-	swpNosize    = 0x0001
+	swpNomove     = 0x0002
+	swpNosize     = 0x0001
 	swpShowWindow = 0x0040
 
-	dtCenter    = 0x00000001
-	dtVcenter   = 0x00000004
+	dtCenter     = 0x00000001
+	dtVcenter    = 0x00000004
 	dtSingleline = 0x00000020
 	dtWordBreak  = 0x00000010
 	dtLeft       = 0x00000000
@@ -164,7 +164,7 @@ const (
 	colorOnColor = 3
 
 	whKeyboardLl = 13
-	hcAction      = 0
+	hcAction     = 0
 
 	vkLwin    = 0x5B
 	vkRwin    = 0x5C
@@ -257,8 +257,8 @@ var (
 )
 
 func init() {
-	wndProcCB   = syscall.NewCallback(overlayWndProc)
-	keyHookCB   = syscall.NewCallback(keyboardHookProc)
+	wndProcCB = syscall.NewCallback(overlayWndProc)
+	keyHookCB = syscall.NewCallback(keyboardHookProc)
 	notifProcCB = syscall.NewCallback(monitorNotifWndProc)
 }
 
@@ -376,7 +376,7 @@ func makeBannerPlaceholder(msg string, maxEdge, quality int) []byte {
 	}
 	h := w * 9 / 16
 
-	bg := color.RGBA{30, 18, 0, 255}    // very dark amber
+	bg := color.RGBA{30, 18, 0, 255}      // very dark amber
 	band := color.RGBA{180, 110, 20, 255} // hazard amber
 	stripe := color.RGBA{20, 12, 0, 255}  // dark
 	fg := color.RGBA{255, 200, 60, 255}   // bright amber for text
@@ -526,7 +526,7 @@ func captureScreenSized(maxEdge int, quality int) ([]byte, error) {
 
 	setupMs := time.Since(t0).Milliseconds()
 	tBlit := time.Now()
-	rb, _, _ := procBitBlt.Call(hdcMem, 0, 0, w, h, hdcScreen, 0, 0, srcCopy|captureBlt)
+	rb, _, _ := procBitBlt.Call(hdcMem, 0, 0, w, h, hdcScreen, 0, 0, blitFlags())
 	blitMs := time.Since(tBlit).Milliseconds()
 	if rb == 0 {
 		devlog.Logf("capture: BitBlt returned 0 w=%d h=%d", w, h)
@@ -1072,7 +1072,6 @@ func hideMonitoringNotification() {
 	}
 }
 
-
 // ── Casting viewer ────────────────────────────────────────────────────────────
 //
 // The student-side cast viewer used to be a hand-rolled Win32 GDI window
@@ -1231,13 +1230,13 @@ func stopMonitoring() {
 // ── Autostart (registry) ──────────────────────────────────────────────────────
 
 const (
-	hkcu            = uintptr(0x80000001)
-	keyQueryValue   = 0x0001
-	keySetValue     = 0x0002
-	regSz           = 1
-	regDword        = 4
-	runKeyPath      = `Software\Microsoft\Windows\CurrentVersion\Run`
-	prefKeyPath     = `Software\ClassSend`
+	hkcu               = uintptr(0x80000001)
+	keyQueryValue      = 0x0001
+	keySetValue        = 0x0002
+	regSz              = 1
+	regDword           = 4
+	runKeyPath         = `Software\Microsoft\Windows\CurrentVersion\Run`
+	prefKeyPath        = `Software\ClassSend`
 	autostartValueName = "ClassSend"
 	autostartPrefName  = "Autostart"
 )
@@ -1421,7 +1420,7 @@ func withRetry(attempts int, delay time.Duration, fn func() error) error {
 const stressInflightLimit = 4
 
 var (
-	stressSem      = make(chan struct{}, stressInflightLimit)
+	stressSem         = make(chan struct{}, stressInflightLimit)
 	stressBusyDrop    atomic.Uint64
 	errAgentBusy      = errors.New("agent busy — command dropped")
 	errAgentUnderLoad = errors.New("agent skipping capture — system under load")
@@ -1495,6 +1494,7 @@ func startHealthBeacon() {
 }
 
 func setupStudentCommands(app *core.App, devMode bool) {
+	logOSTuning()
 	sendShot := func(data []byte) {
 		msg, err := protocol.Encode(protocol.TypeScreenshot, protocol.ScreenshotPayload{
 			StudentID: app.Hostname,
